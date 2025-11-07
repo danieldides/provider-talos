@@ -19,13 +19,14 @@ package configurationapply
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
@@ -278,9 +279,10 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 		// Use insecure gRPC connection for machines in maintenance mode
 		fmt.Printf("Using insecure gRPC connection for maintenance mode machine\n")
 		talosClient, err = talosclient.New(ctx,
-			talosclient.WithConfig(nil), // Skip config loading for insecure mode
-			talosclient.WithGRPCDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
 			talosclient.WithEndpoints(endpoints...),
+			talosclient.WithTLSConfig(&tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance mode machines
+			}),
 		)
 	} else {
 		// Create a certificate from the provided certificates
@@ -372,10 +374,22 @@ func (c *external) generateMachineConfigurationYAML(config v1alpha1.MachineConfi
 
 	// Build CA section
 	caSection := ""
-	if config.Machine.CA != nil && config.Machine.CA.Crt != "" && config.Machine.CA.Key != "" {
-		caSection = fmt.Sprintf(`  ca:
+	if config.Machine.CA != nil && config.Machine.CA.Crt != "" {
+		if machineType == "controlplane" && config.Machine.CA.Key != "" {
+			// Controlplane nodes get the full CA with private key
+			crtBase64 := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(config.Machine.CA.Crt)))
+			keyBase64 := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(config.Machine.CA.Key)))
+
+			caSection = fmt.Sprintf(`  ca:
     crt: %s
-    key: %s`, config.Machine.CA.Crt, config.Machine.CA.Key)
+    key: %s`, crtBase64, keyBase64)
+		} else {
+			// Worker nodes only get the certificate in acceptedCAs (no private key)
+			crtBase64 := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(config.Machine.CA.Crt)))
+
+			caSection = fmt.Sprintf(`  acceptedCAs:
+    - crt: %s`, crtBase64)
+		}
 	}
 
 	// Generate YAML configuration
