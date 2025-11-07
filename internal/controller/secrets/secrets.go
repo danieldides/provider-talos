@@ -194,28 +194,45 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	// Check if secrets already exist in status (locally generated)
 	statusExists := cr.Status.AtProvider.MachineSecrets != nil && cr.Status.AtProvider.ClientConfiguration != nil
 
-	// Secrets are local resources - they're always generated locally
-	resourceExists := statusExists
-	resourceUpToDate := statusExists
+	// If secrets don't exist yet, generate them now
+	if !statusExists {
+		fmt.Printf("Generating secrets for: %s\n", cr.Name)
+		generatedSecrets, err := c.generateMachineSecrets(cr.Spec.ForProvider.TalosVersion)
+		if err != nil {
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to generate machine secrets")
+		}
 
+		// Update the resource status with generated secrets
+		cr.Status.AtProvider.MachineSecrets = &v1alpha1.MachineSecretsData{
+			ClusterSecrets:    generatedSecrets.ClusterSecrets,
+			KubernetesSecrets: generatedSecrets.KubernetesSecrets,
+			TrustdInfo:        generatedSecrets.TrustdInfo,
+		}
+
+		cr.Status.AtProvider.ClientConfiguration = &v1alpha1.ClientConfiguration{
+			CACertificate:     generatedSecrets.CACertificate,
+			ClientCertificate: generatedSecrets.ClientCertificate,
+			ClientKey:         generatedSecrets.ClientKey,
+		}
+
+		fmt.Printf("Successfully generated secrets (length: %d bytes)\n", len(generatedSecrets.ClusterSecrets))
+	}
+
+	// Secrets are local resources - always exist after generation
 	connectionDetails := managed.ConnectionDetails{}
-	if resourceExists && cr.Status.AtProvider.ClientConfiguration != nil {
+	if cr.Status.AtProvider.ClientConfiguration != nil {
 		// Store client configuration as connection details
 		connectionDetails["ca_certificate"] = []byte(cr.Status.AtProvider.ClientConfiguration.CACertificate)
 		connectionDetails["client_certificate"] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientCertificate)
 		connectionDetails["client_key"] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientKey)
 	}
 
-	// Set conditions based on actual state
-	if resourceExists && resourceUpToDate {
-		cr.SetConditions(xpv1.Available())
-	} else {
-		cr.SetConditions(xpv1.Unavailable())
-	}
+	// Set Ready condition
+	cr.SetConditions(xpv1.Available())
 
 	return managed.ExternalObservation{
-		ResourceExists:    resourceExists,
-		ResourceUpToDate:  resourceUpToDate,
+		ResourceExists:    true,
+		ResourceUpToDate:  true,
 		ConnectionDetails: connectionDetails,
 	}, nil
 }

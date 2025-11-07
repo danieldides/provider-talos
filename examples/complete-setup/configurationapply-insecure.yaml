@@ -1,0 +1,33 @@
+apiVersion: machine.talos.crossplane.io/v1alpha1
+kind: ConfigurationApply
+metadata:
+  name: apply-worker-config
+spec:
+  forProvider:
+    node: "192.168.120.87"  # Update with your Talos machine IP
+    machineConfiguration:
+      version: v1alpha1
+      machine:
+        type: worker
+        token: "example-token-12345"  # Will be replaced with actual token from Secrets
+        install:
+          disk: /dev/sda
+          image: factory.talos.dev/installer/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515:v1.8.0
+      cluster:
+        id: "cluster-id-placeholder"  # Will be replaced with actual ID from Secrets
+        secret: "cluster-secret-placeholder"  # Will be replaced with actual secret from Secrets
+        token: "cluster-token-placeholder"  # Will be replaced with actual token from Secrets
+        clusterName: demo-cluster
+        controlPlane:
+          endpoint: https://192.168.120.87:6443
+        network:
+          podSubnets:
+            - 10.244.0.0/16
+          serviceSubnets:
+            - 10.96.0.0/12
+    clientConfiguration:
+      caCertificate: "insecure"
+      clientCertificate: "insecure"
+      clientKey: "insecure"
+  providerConfigRef:
+    name: default

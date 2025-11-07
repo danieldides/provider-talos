@@ -1,0 +1,13 @@
+apiVersion: machine.talos.crossplane.io/v1alpha1
+kind: Configuration
+metadata:
+  name: worker-config
+spec:
+  forProvider:
+    node: "192.168.120.87"
+    clusterName: demo-cluster
+    machineType: worker
+    clusterEndpoint: https://192.168.120.87:6443
+    talosVersion: v1.8.0
+  providerConfigRef:
+    name: default
