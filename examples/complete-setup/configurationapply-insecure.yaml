@@ -40,6 +40,19 @@ spec:
             - 10.244.0.0/16
           serviceSubnets:
             - 10.96.0.0/12
+        ca:
+          crt: |
+            -----BEGIN CERTIFICATE-----
+            MIIBijCCATCgAwIBAgIRAJk9Sabg76spXguw+SxKZCMwCgYIKoZIzj0EAwIwFTET
+            MBEGA1UEChMKa3ViZXJuZXRlczAeFw0yNTExMDcxOTM0MTRaFw0zNTExMDUxOTM0
+            MTRaMBUxEzARBgNVBAoTCmt1YmVybmV0ZXMwWTATBgcqhkjOPQIBBggqhkjOPQMB
+            BwNCAATgqgBpYvT0taXWwhaaJCkn6d9PNoFSjQWm5V87GK7QfT0HenFbvH4DUxvO
+            /ap6rsydOg56oCjN0MalxBmYZG6no2EwXzAOBgNVHQ8BAf8EBAMCAoQwHQYDVR0l
+            BBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
+            BBYEFCe/UWwIQE92NJ6+ckv6UwJujKTTMAoGCCqGSM49BAMCA0gAMEUCIQCHFp7x
+            Vmjypv2WEXOP8jI0JKYILvOYpmpJhKW349yQLgIgQ4Ms7n/Q4CSEdJGmnpsbkqG4
+            O0cQcD+4bdZKFlU4Ggw=
+            -----END CERTIFICATE-----
     clientConfiguration:
       caCertificate: "insecure"
       clientCertificate: "insecure"

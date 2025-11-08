@@ -162,6 +162,10 @@ type ClusterSpec struct {
 
 	// Token for cluster bootstrap
 	Token string `json:"token"`
+
+	// CA defines the Kubernetes CA configuration (optional)
+	// +optional
+	CA *CASpec `json:"ca,omitempty"`
 }
 
 // InstallSpec defines installation configuration
@@ -222,8 +226,9 @@ type CASpec struct {
 	// Crt is the PEM-encoded certificate
 	Crt string `json:"crt"`
 
-	// Key is the PEM-encoded private key
-	Key string `json:"key"`
+	// Key is the PEM-encoded private key (optional)
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 func init() {

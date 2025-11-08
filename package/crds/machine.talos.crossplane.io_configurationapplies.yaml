@@ -116,6 +116,19 @@ spec:
                       cluster:
                         description: Cluster configuration
                         properties:
+                          ca:
+                            description: CA defines the Kubernetes CA configuration
+                              (optional)
+                            properties:
+                              crt:
+                                description: Crt is the PEM-encoded certificate
+                                type: string
+                              key:
+                                description: Key is the PEM-encoded private key (optional)
+                                type: string
+                            required:
+                            - crt
+                            type: object
                           clusterName:
                             description: ClusterName is the name of the cluster
                             type: string
@@ -175,11 +188,10 @@ spec:
                                 description: Crt is the PEM-encoded certificate
                                 type: string
                               key:
-                                description: Key is the PEM-encoded private key
+                                description: Key is the PEM-encoded private key (optional)
                                 type: string
                             required:
                             - crt
-                            - key
                             type: object
                           features:
                             description: Features configuration (optional)

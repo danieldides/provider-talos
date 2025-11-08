@@ -372,7 +372,7 @@ func (c *external) generateMachineConfigurationYAML(config v1alpha1.MachineConfi
     diskQuotaSupport: true`
 	}
 
-	// Build CA section
+	// Build machine CA section
 	caSection := ""
 	if config.Machine.CA != nil && config.Machine.CA.Crt != "" {
 		if machineType == "controlplane" && config.Machine.CA.Key != "" {
@@ -389,6 +389,25 @@ func (c *external) generateMachineConfigurationYAML(config v1alpha1.MachineConfi
 
 			caSection = fmt.Sprintf(`  acceptedCAs:
     - crt: %s`, crtBase64)
+		}
+	}
+
+	// Build cluster CA section (Kubernetes CA)
+	clusterCASection := ""
+	if config.Cluster.CA != nil && config.Cluster.CA.Crt != "" {
+		// Base64 encode the Kubernetes CA certificate
+		crtBase64 := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(config.Cluster.CA.Crt)))
+
+		if config.Cluster.CA.Key != "" {
+			// Include both certificate and key if key is provided
+			keyBase64 := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(config.Cluster.CA.Key)))
+			clusterCASection = fmt.Sprintf(`  ca:
+    crt: %s
+    key: %s`, crtBase64, keyBase64)
+		} else {
+			// Include only certificate if no key is provided (typical for worker nodes)
+			clusterCASection = fmt.Sprintf(`  ca:
+    crt: %s`, crtBase64)
 		}
 	}
 
@@ -424,6 +443,7 @@ cluster:
     serviceSubnets:
       - %s
   token: %s
+%s
   secretboxEncryptionSecret: ""
 `,
 		version,
@@ -443,6 +463,7 @@ cluster:
 		podSubnets[0],     // First pod subnet
 		serviceSubnets[0], // First service subnet
 		config.Cluster.Token,
+		clusterCASection,
 	)
 
 	return yamlConfig, nil
