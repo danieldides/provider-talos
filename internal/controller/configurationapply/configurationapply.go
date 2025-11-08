@@ -21,7 +21,9 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"strings"
+	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
@@ -171,13 +173,8 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	fmt.Printf("Observing ConfigurationApply: %s\n", cr.Name)
 
-	// Check if configuration has been applied
+	// Check if configuration has been applied according to status
 	configApplied := cr.Status.AtProvider.Applied
-
-	// Resource exists if we have applied the configuration
-	// Once applied, the machine reboots and is no longer accessible via maintenance API
-	// So we consider the resource as existing if it was previously applied
-	resourceExists := configApplied
 
 	// Check if we have a valid machine configuration from structured fields
 	hasValidConfig := cr.Spec.ForProvider.MachineConfiguration.Version != "" &&
@@ -185,12 +182,30 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		cr.Spec.ForProvider.MachineConfiguration.Machine.Token != "" &&
 		cr.Spec.ForProvider.MachineConfiguration.Cluster.ID != ""
 
+	// If we think config was applied, verify the machine isn't back in maintenance mode (reverted)
+	machineInMaintenanceMode := false
+	if configApplied {
+		// Try to connect to the machine to check if it's accessible (indicating it was reverted)
+		machineInMaintenanceMode = c.checkMachineAccessible(ctx, cr)
+
+		if machineInMaintenanceMode {
+			// Machine is accessible again - it must have been reverted to maintenance mode
+			// Reset the applied status so configuration will be re-applied
+			fmt.Printf("Machine %s is back in maintenance mode (reverted) - will re-apply configuration\n", cr.Spec.ForProvider.Node)
+			configApplied = false
+			cr.Status.AtProvider.Applied = false
+		}
+	}
+
+	// Resource exists if we have applied the configuration
+	// Once applied, the machine reboots and is no longer accessible via maintenance API
+	resourceExists := configApplied
+
 	// Resource is up to date if it exists and has valid config
-	// ConfigurationApply is a one-time operation - once applied, it's considered up to date
 	resourceUpToDate := resourceExists && hasValidConfig
 
-	fmt.Printf("ConfigurationApply exists: %v, up to date: %v, has valid config: %v, applied: %v\n",
-		resourceExists, resourceUpToDate, hasValidConfig, configApplied)
+	fmt.Printf("ConfigurationApply exists: %v, up to date: %v, has valid config: %v, applied: %v, maintenance mode: %v\n",
+		resourceExists, resourceUpToDate, hasValidConfig, configApplied, machineInMaintenanceMode)
 
 	// Set Ready condition if configuration has been applied
 	if configApplied {
@@ -268,6 +283,32 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) (managed.Ext
 
 func (c *external) Disconnect(ctx context.Context) error {
 	return nil
+}
+
+// checkMachineAccessible checks if the Talos machine is accessible on the maintenance API
+// Returns true if the machine is accessible (in maintenance mode), false otherwise
+func (c *external) checkMachineAccessible(ctx context.Context, cr *v1alpha1.ConfigurationApply) bool {
+	// Simple TCP connection check to see if maintenance port is accessible
+	// If the port is accessible, the machine is likely in maintenance mode
+	node := cr.Spec.ForProvider.Node
+	address := node + ":50000"
+
+	// Use a short timeout for the connectivity check
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// Try to establish a connection
+	var d net.Dialer
+	conn, err := d.DialContext(checkCtx, "tcp", address)
+	if err != nil {
+		// Connection failed - machine is not accessible (likely rebooted/installing)
+		return false
+	}
+	defer conn.Close()
+
+	// Connection succeeded - machine is accessible on maintenance port
+	fmt.Printf("Machine %s is accessible in maintenance mode\n", node)
+	return true
 }
 
 // applyConfigurationToNode applies a Talos configuration to the specified node
