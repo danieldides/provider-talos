@@ -35,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
@@ -172,10 +173,11 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	// Check if configuration has been applied
 	configApplied := cr.Status.AtProvider.Applied
-	appliedTimeExists := true // Always true for now since we don't have this field
 
 	// Resource exists if we have applied the configuration
-	resourceExists := configApplied && appliedTimeExists
+	// Once applied, the machine reboots and is no longer accessible via maintenance API
+	// So we consider the resource as existing if it was previously applied
+	resourceExists := configApplied
 
 	// Check if we have a valid machine configuration from structured fields
 	hasValidConfig := cr.Spec.ForProvider.MachineConfiguration.Version != "" &&
@@ -184,9 +186,16 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		cr.Spec.ForProvider.MachineConfiguration.Cluster.ID != ""
 
 	// Resource is up to date if it exists and has valid config
+	// ConfigurationApply is a one-time operation - once applied, it's considered up to date
 	resourceUpToDate := resourceExists && hasValidConfig
 
-	fmt.Printf("ConfigurationApply exists: %v, up to date: %v, has valid config: %v\n", resourceExists, resourceUpToDate, hasValidConfig)
+	fmt.Printf("ConfigurationApply exists: %v, up to date: %v, has valid config: %v, applied: %v\n",
+		resourceExists, resourceUpToDate, hasValidConfig, configApplied)
+
+	// Set Ready condition if configuration has been applied
+	if configApplied {
+		cr.SetConditions(xpv1.Available())
+	}
 
 	return managed.ExternalObservation{
 		ResourceExists:    resourceExists,
@@ -212,6 +221,11 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	// Update status
 	cr.Status.AtProvider.Applied = true
 	// Note: LastAppliedTime field doesn't exist in the generated API, skipping
+
+	// Set Ready condition since configuration was successfully applied
+	cr.SetConditions(xpv1.Available())
+
+	fmt.Printf("Successfully marked ConfigurationApply as applied: %s\n", cr.Name)
 
 	return managed.ExternalCreation{
 		ConnectionDetails: managed.ConnectionDetails{},
