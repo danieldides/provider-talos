@@ -27,8 +27,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
+	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
@@ -324,47 +323,21 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 	// For now, skip config parsing validation
 	// In a complete implementation, this would validate the configuration
 
-	// Create client config - support insecure mode for maintenance mode machines
-	clientConfig := cr.Spec.ForProvider.ClientConfiguration
-	endpoints := []string{cr.Spec.ForProvider.Node + ":50000"} // Default Talos port
-
-	var talosClient *talosclient.Client
-
-	if clientConfig.ClientCertificate == "" || clientConfig.ClientCertificate == "insecure" {
-		// Use insecure gRPC connection for machines in maintenance mode
-		fmt.Printf("Using insecure gRPC connection for maintenance mode machine\n")
-		talosClient, err = talosclient.New(ctx,
-			talosclient.WithEndpoints(endpoints...),
-			talosclient.WithTLSConfig(&tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance mode machines
-			}),
-		)
-	} else {
-		// Create a certificate from the provided certificates
-		cert, certErr := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
-		if certErr != nil {
-			return errors.Wrap(certErr, "failed to create client certificate")
-		}
-
-		fmt.Printf("Using secure TLS connection with client certificates\n")
-		talosClient, err = talosclient.New(ctx,
-			talosclient.WithGRPCDialOptions(grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-				Certificates: []tls.Certificate{cert},
-				ServerName:   cr.Spec.ForProvider.Node, // Use node IP as server name
-				MinVersion:   tls.VersionTLS12,
-			}))),
-			talosclient.WithEndpoints(endpoints...),
-		)
-	}
+	talosClient, err := newConfigurationApplyTalosClient(ctx, cr)
 	if err != nil {
 		return errors.Wrap(err, "failed to create Talos client")
 	}
 	defer talosClient.Close() // nolint:errcheck
 
+	mode, err := getConfigurationApplyMode(cr)
+	if err != nil {
+		return err
+	}
+
 	// Apply the configuration to the node
 	_, err = talosClient.ApplyConfiguration(ctx, &machine.ApplyConfigurationRequest{
 		Data: []byte(configInput),
-		Mode: machine.ApplyConfigurationRequest_REBOOT, // Required for maintenance mode
+		Mode: mode,
 	})
 	if err != nil {
 		return errors.Wrap(err, "failed to apply configuration to Talos node")
@@ -372,6 +345,70 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 
 	fmt.Printf("Successfully applied configuration to node %s\n", cr.Spec.ForProvider.Node)
 	return nil
+}
+
+func newConfigurationApplyTalosClient(ctx context.Context, cr *v1alpha1.ConfigurationApply) (*talosclient.Client, error) {
+	clientConfig := cr.Spec.ForProvider.ClientConfiguration
+	endpoint := getConfigurationApplyEndpoint(cr)
+
+	if clientConfig.ClientCertificate == "" || clientConfig.ClientCertificate == "insecure" {
+		fmt.Printf("Using insecure gRPC connection for maintenance mode machine\n")
+
+		return talosclient.New(ctx,
+			talosclient.WithEndpoints(endpoint),
+			talosclient.WithTLSConfig(&tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance mode machines
+			}),
+		)
+	}
+
+	if _, err := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey)); err != nil {
+		return nil, errors.Wrap(err, "failed to create client certificate")
+	}
+
+	fmt.Printf("Using secure TLS connection with inline client configuration\n")
+
+	return talosclient.New(ctx,
+		talosclient.WithConfigContext(getConfigurationApplyClientContext(cr)),
+	)
+}
+
+func getConfigurationApplyClientContext(cr *v1alpha1.ConfigurationApply) *clientconfig.Context {
+	clientConfig := cr.Spec.ForProvider.ClientConfiguration
+
+	return &clientconfig.Context{
+		Endpoints: []string{getConfigurationApplyEndpoint(cr)},
+		CA:        base64.StdEncoding.EncodeToString([]byte(clientConfig.CACertificate)),
+		Crt:       base64.StdEncoding.EncodeToString([]byte(clientConfig.ClientCertificate)),
+		Key:       base64.StdEncoding.EncodeToString([]byte(clientConfig.ClientKey)),
+	}
+}
+
+func getConfigurationApplyEndpoint(cr *v1alpha1.ConfigurationApply) string {
+	if cr.Spec.ForProvider.Endpoint != nil && *cr.Spec.ForProvider.Endpoint != "" {
+		return *cr.Spec.ForProvider.Endpoint
+	}
+
+	return cr.Spec.ForProvider.Node + ":50000"
+}
+
+func getConfigurationApplyMode(cr *v1alpha1.ConfigurationApply) (machine.ApplyConfigurationRequest_Mode, error) {
+	if cr.Spec.ForProvider.ApplyMode == nil || *cr.Spec.ForProvider.ApplyMode == "" {
+		return machine.ApplyConfigurationRequest_REBOOT, nil
+	}
+
+	switch *cr.Spec.ForProvider.ApplyMode {
+	case "auto":
+		return machine.ApplyConfigurationRequest_AUTO, nil
+	case "reboot":
+		return machine.ApplyConfigurationRequest_REBOOT, nil
+	case "no_reboot":
+		return machine.ApplyConfigurationRequest_NO_REBOOT, nil
+	case "staged":
+		return machine.ApplyConfigurationRequest_STAGED, nil
+	default:
+		return 0, errors.Errorf("unsupported applyMode %q", *cr.Spec.ForProvider.ApplyMode)
+	}
 }
 
 // generateMachineConfigurationYAML converts structured configuration to Talos machine configuration YAML
