@@ -326,7 +326,7 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 
 	// Create client config - support insecure mode for maintenance mode machines
 	clientConfig := cr.Spec.ForProvider.ClientConfiguration
-	endpoints := []string{cr.Spec.ForProvider.Node + ":50000"} // Default Talos port
+	endpoint := getConfigurationApplyEndpoint(cr)
 
 	var talosClient *talosclient.Client
 
@@ -334,7 +334,7 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 		// Use insecure gRPC connection for machines in maintenance mode
 		fmt.Printf("Using insecure gRPC connection for maintenance mode machine\n")
 		talosClient, err = talosclient.New(ctx,
-			talosclient.WithEndpoints(endpoints...),
+			talosclient.WithEndpoints(endpoint),
 			talosclient.WithTLSConfig(&tls.Config{
 				InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance mode machines
 			}),
@@ -353,7 +353,7 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 				ServerName:   cr.Spec.ForProvider.Node, // Use node IP as server name
 				MinVersion:   tls.VersionTLS12,
 			}))),
-			talosclient.WithEndpoints(endpoints...),
+			talosclient.WithEndpoints(endpoint),
 		)
 	}
 	if err != nil {
@@ -372,6 +372,15 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 
 	fmt.Printf("Successfully applied configuration to node %s\n", cr.Spec.ForProvider.Node)
 	return nil
+}
+
+func getConfigurationApplyEndpoint(cr *v1alpha1.ConfigurationApply) string {
+	endpoint := cr.Spec.ForProvider.Node + ":50000"
+	if cr.Spec.ForProvider.Endpoint != nil && *cr.Spec.ForProvider.Endpoint != "" {
+		endpoint = *cr.Spec.ForProvider.Endpoint
+	}
+
+	return endpoint
 }
 
 // generateMachineConfigurationYAML converts structured configuration to Talos machine configuration YAML

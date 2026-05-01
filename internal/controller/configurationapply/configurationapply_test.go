@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	v1alpha1 "github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/pkg/test"
@@ -68,6 +69,57 @@ func TestObserve(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.want.o, got); diff != "" {
 				t.Errorf("\n%s\ne.Observe(...): -want, +got:\n%s\n", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestGetConfigurationApplyEndpoint(t *testing.T) {
+	node := "127.0.0.2"
+	customEndpoint := "127.0.0.1:50000"
+	emptyEndpoint := ""
+
+	tests := map[string]struct {
+		cr   *v1alpha1.ConfigurationApply
+		want string
+	}{
+		"DefaultsToNodePort": {
+			cr: &v1alpha1.ConfigurationApply{
+				Spec: v1alpha1.ConfigurationApplySpec{
+					ForProvider: v1alpha1.ConfigurationApplyParameters{Node: node},
+				},
+			},
+			want: node + ":50000",
+		},
+		"UsesProvidedEndpoint": {
+			cr: &v1alpha1.ConfigurationApply{
+				Spec: v1alpha1.ConfigurationApplySpec{
+					ForProvider: v1alpha1.ConfigurationApplyParameters{
+						Node:     node,
+						Endpoint: &customEndpoint,
+					},
+				},
+			},
+			want: customEndpoint,
+		},
+		"IgnoresEmptyEndpoint": {
+			cr: &v1alpha1.ConfigurationApply{
+				Spec: v1alpha1.ConfigurationApplySpec{
+					ForProvider: v1alpha1.ConfigurationApplyParameters{
+						Node:     node,
+						Endpoint: &emptyEndpoint,
+					},
+				},
+			},
+			want: node + ":50000",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := getConfigurationApplyEndpoint(tc.cr)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("getConfigurationApplyEndpoint(...): -want, +got:\n%s", diff)
 			}
 		})
 	}
