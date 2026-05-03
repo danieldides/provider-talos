@@ -37,7 +37,7 @@ kind: Provider
 metadata:
   name: provider-talos
 spec:
-  package: ghcr.io/crossplane-contrib/provider-talos:v0.1.3-7.gbe08ce3
+  package: ghcr.io/crossplane-contrib/provider-talos:v0.1.3
 EOF
 ```
 
