@@ -21,7 +21,6 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
-	"net"
 	"strings"
 	"time"
 
@@ -33,6 +32,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
 	"github.com/pkg/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -154,7 +154,10 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errNewClient)
 	}
 
-	return &external{service: svc}, nil
+	return &external{
+		service:            svc,
+		providerConfigData: data,
+	}, nil
 }
 
 // An ExternalClient observes, then either creates, updates, or deletes an
@@ -163,6 +166,8 @@ type external struct {
 	// A 'client' used to connect to the external resource API. In practice this
 	// would be something like an AWS SDK client.
 	service interface{}
+	// ProviderConfig credentials for verifying machine state
+	providerConfigData []byte
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
@@ -173,8 +178,13 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	fmt.Printf("Observing ConfigurationApply: %s\n", cr.Name)
 
-	// Check if configuration has been applied according to status
-	configApplied := cr.Status.AtProvider.Applied
+	// Check the actual state of the machine
+	machineState := c.checkMachineState(ctx, cr)
+
+	// Update status with detected machine state
+	now := metav1.Now()
+	cr.Status.AtProvider.MachineState = string(machineState)
+	cr.Status.AtProvider.LastStateCheck = &now
 
 	// Check if we have a valid machine configuration from structured fields
 	hasValidConfig := cr.Spec.ForProvider.MachineConfiguration.Version != "" &&
@@ -182,34 +192,39 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		cr.Spec.ForProvider.MachineConfiguration.Machine.Token != "" &&
 		cr.Spec.ForProvider.MachineConfiguration.Cluster.ID != ""
 
-	// If we think config was applied, verify the machine isn't back in maintenance mode (reverted)
-	machineInMaintenanceMode := false
-	if configApplied {
-		// Try to connect to the machine to check if it's accessible (indicating it was reverted)
-		machineInMaintenanceMode = c.checkMachineAccessible(ctx, cr)
+	// Determine resource state based on machine state
+	var resourceExists, resourceUpToDate bool
 
-		if machineInMaintenanceMode {
-			// Machine is accessible again - it must have been reverted to maintenance mode
-			// Reset the applied status so configuration will be re-applied
-			fmt.Printf("Machine %s is back in maintenance mode (reverted) - will re-apply configuration\n", cr.Spec.ForProvider.Node)
-			configApplied = false
-			cr.Status.AtProvider.Applied = false
-		}
-	}
+	switch machineState {
+	case MachineStateMaintenanceMode:
+		// Machine is in maintenance mode - configuration needs to be applied
+		resourceExists = false
+		resourceUpToDate = false
+		cr.Status.AtProvider.Applied = false
+		fmt.Printf("Machine %s in maintenance mode - configuration not applied\n", cr.Spec.ForProvider.Node)
 
-	// Resource exists if we have applied the configuration
-	// Once applied, the machine reboots and is no longer accessible via maintenance API
-	resourceExists := configApplied
-
-	// Resource is up to date if it exists and has valid config
-	resourceUpToDate := resourceExists && hasValidConfig
-
-	fmt.Printf("ConfigurationApply exists: %v, up to date: %v, has valid config: %v, applied: %v, maintenance mode: %v\n",
-		resourceExists, resourceUpToDate, hasValidConfig, configApplied, machineInMaintenanceMode)
-
-	// Set Ready condition if configuration has been applied
-	if configApplied {
+	case MachineStateConfigured:
+		// Machine is configured and running - verified with authenticated connection
+		resourceExists = true
+		resourceUpToDate = hasValidConfig
+		cr.Status.AtProvider.Applied = true
 		cr.SetConditions(xpv1.Available())
+		fmt.Printf("Machine %s is configured and running\n", cr.Spec.ForProvider.Node)
+
+	case MachineStateUnreachable:
+		// Machine is unreachable - could be installing or failed
+		if cr.Status.AtProvider.Applied {
+			// We previously applied config - assume it's installing/rebooting (expected)
+			resourceExists = true
+			resourceUpToDate = hasValidConfig
+			cr.SetConditions(xpv1.Available())
+			fmt.Printf("Machine %s unreachable but configuration was applied - likely installing\n", cr.Spec.ForProvider.Node)
+		} else {
+			// Never applied config and unreachable - needs configuration
+			resourceExists = false
+			resourceUpToDate = false
+			fmt.Printf("Machine %s unreachable and configuration not applied\n", cr.Spec.ForProvider.Node)
+		}
 	}
 
 	return managed.ExternalObservation{
@@ -285,30 +300,114 @@ func (c *external) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-// checkMachineAccessible checks if the Talos machine is accessible on the maintenance API
-// Returns true if the machine is accessible (in maintenance mode), false otherwise
-func (c *external) checkMachineAccessible(ctx context.Context, cr *v1alpha1.ConfigurationApply) bool {
-	// Simple TCP connection check to see if maintenance port is accessible
-	// If the port is accessible, the machine is likely in maintenance mode
+// MachineState represents the detected state of the Talos machine
+type MachineState string
+
+const (
+	MachineStateMaintenanceMode MachineState = "MaintenanceMode"
+	MachineStateConfigured      MachineState = "Configured"
+	MachineStateUnreachable     MachineState = "Unreachable"
+)
+
+// checkMachineState checks the current state of the Talos machine
+// Returns the machine state: MaintenanceMode, Configured, or Unreachable
+func (c *external) checkMachineState(ctx context.Context, cr *v1alpha1.ConfigurationApply) MachineState {
 	node := cr.Spec.ForProvider.Node
-	address := node + ":50000"
 
 	// Use a short timeout for the connectivity check
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	// Try to establish a connection
-	var d net.Dialer
-	conn, err := d.DialContext(checkCtx, "tcp", address)
+	// First, try to connect with insecure (maintenance mode)
+	if c.canConnectInsecure(checkCtx, cr) {
+		fmt.Printf("Machine %s is in maintenance mode (insecure connection succeeded)\n", node)
+		return MachineStateMaintenanceMode
+	}
+
+	// Try to connect with configured credentials (if not insecure)
+	clientConfig := cr.Spec.ForProvider.ClientConfiguration
+	if clientConfig.ClientCertificate != "" && clientConfig.ClientCertificate != "insecure" {
+		if c.canConnectWithCreds(checkCtx, cr) {
+			fmt.Printf("Machine %s is configured and running (authenticated connection succeeded)\n", node)
+			return MachineStateConfigured
+		}
+	}
+
+	// Machine is not accessible
+	fmt.Printf("Machine %s is unreachable (installing or failed)\n", node)
+	return MachineStateUnreachable
+}
+
+// canConnectInsecure checks if the machine accepts insecure connections (maintenance mode)
+func (c *external) canConnectInsecure(ctx context.Context, cr *v1alpha1.ConfigurationApply) bool {
+	endpoint := getConfigurationApplyEndpoint(cr)
+
+	talosClient, err := talosclient.New(ctx,
+		talosclient.WithEndpoints(endpoint),
+		talosclient.WithTLSConfig(&tls.Config{
+			InsecureSkipVerify: true, //nolint:gosec
+		}),
+	)
 	if err != nil {
-		// Connection failed - machine is not accessible (likely rebooted/installing)
 		return false
 	}
-	defer conn.Close()
+	defer talosClient.Close() //nolint:errcheck
 
-	// Connection succeeded - machine is accessible on maintenance port
-	fmt.Printf("Machine %s is accessible in maintenance mode\n", node)
-	return true
+	// Try a simple operation - if it works without authentication, we're in maintenance mode
+	// Use a timeout to avoid hanging
+	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	// Try to call an API - even if it fails, the connection pattern tells us the mode
+	_, err = talosClient.Version(checkCtx)
+	if err == nil {
+		// Version succeeded with insecure connection - definitely maintenance mode
+		return true
+	}
+
+	// Check error type to determine machine state
+	errStr := err.Error()
+	// "Unimplemented" means maintenance mode API (connection succeeded but API not available)
+	if strings.Contains(errStr, "Unimplemented") || strings.Contains(errStr, "not implemented in maintenance") {
+		return true
+	}
+	// Auth errors mean configured mode (machine requires credentials)
+	if strings.Contains(errStr, "authentication") || strings.Contains(errStr, "credentials") {
+		return false
+	}
+	// Any other error (connection refused, timeout, etc.) means unreachable
+	return false
+}
+
+// canConnectWithCreds checks if the machine accepts authenticated connections (configured mode)
+func (c *external) canConnectWithCreds(ctx context.Context, cr *v1alpha1.ConfigurationApply) bool {
+	clientConfig := cr.Spec.ForProvider.ClientConfiguration
+	endpoint := getConfigurationApplyEndpoint(cr)
+
+	cert, err := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
+	if err != nil {
+		return false
+	}
+
+	talosClient, err := talosclient.New(ctx,
+		talosclient.WithGRPCDialOptions(grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ServerName:   cr.Spec.ForProvider.Node,
+			MinVersion:   tls.VersionTLS12,
+		}))),
+		talosclient.WithEndpoints(endpoint),
+	)
+	if err != nil {
+		return false
+	}
+	defer talosClient.Close() //nolint:errcheck
+
+	// Try to get version with authenticated connection
+	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	_, err = talosClient.Version(checkCtx)
+	return err == nil
 }
 
 // applyConfigurationToNode applies a Talos configuration to the specified node

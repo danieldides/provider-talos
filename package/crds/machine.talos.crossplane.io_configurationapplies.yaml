@@ -445,6 +445,15 @@ spec:
                       application
                     format: date-time
                     type: string
+                  lastStateCheck:
+                    description: LastStateCheck is the timestamp of the last state
+                      verification
+                    format: date-time
+                    type: string
+                  machineState:
+                    description: MachineState indicates the current state of the machine
+                      (MaintenanceMode, Configured, Unreachable)
+                    type: string
                 type: object
               conditions:
                 description: Conditions of the resource.

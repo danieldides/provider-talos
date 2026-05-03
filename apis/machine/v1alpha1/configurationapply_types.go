@@ -54,6 +54,10 @@ type ConfigurationApplyObservation struct {
 	Applied bool `json:"applied,omitempty"`
 	// LastAppliedTime is the timestamp of the last successful application
 	LastAppliedTime *metav1.Time `json:"lastAppliedTime,omitempty"`
+	// MachineState indicates the current state of the machine (MaintenanceMode, Configured, Unreachable)
+	MachineState string `json:"machineState,omitempty"`
+	// LastStateCheck is the timestamp of the last state verification
+	LastStateCheck *metav1.Time `json:"lastStateCheck,omitempty"`
 }
 
 // A ConfigurationApplySpec defines the desired state of a ConfigurationApply.
