@@ -3,15 +3,19 @@
 > **Note:** This provider is a work in progress. Contributions are welcome!
 
 `provider-talos` is a [Crossplane](https://crossplane.io/) infrastructure provider
-for [Talos Linux](https://www.talos.dev/). Built with [Upjet](https://github.com/upbound/upjet),
-it exposes XRM-conformant managed resources for the Talos API.
+for [Talos Linux](https://www.talos.dev/). It is a native Crossplane provider:
+resource types and controllers are hand-written using crossplane-runtime, and the
+controllers integrate directly with the
+[Talos Go SDK](https://github.com/siderolabs/talos/tree/main/pkg/machinery) to
+manage real Talos machines.
 
 ## Overview
 
 The Talos provider enables platform teams to create and configure Talos Linux
-infrastructure using Kubernetes APIs. This provider leverages the official
-[siderolabs/terraform-provider-talos](https://github.com/siderolabs/terraform-provider-talos)
-to offer comprehensive Talos cluster lifecycle management.
+infrastructure using Kubernetes APIs. Resource shapes and behavior are modeled on
+the [siderolabs/terraform-provider-talos](https://github.com/siderolabs/terraform-provider-talos)
+provider, but no code is generated from it; the Talos SDK is the runtime
+dependency.
 
 ## Features
 
@@ -37,7 +41,7 @@ kind: Provider
 metadata:
   name: provider-talos
 spec:
-  package: ghcr.io/crossplane-contrib/provider-talos:v0.1.3
+  package: ghcr.io/crossplane-contrib/provider-talos:v0.1.4
 EOF
 ```
 
@@ -45,43 +49,26 @@ Notice that the provider is installed in the crossplane-system namespace alongsi
 
 ### Configuration
 
-Create a ProviderConfig with your Talos cluster connection details:
+Create a ProviderConfig. The provider does not require external credentials for
+local resource generation (Configuration, Secrets) and reads per-resource
+client configuration from the managed resource's `clientConfiguration` field for
+machine API operations:
 
 ```yaml
-apiVersion: talos.crossplane.io/v1beta1
+apiVersion: talos.crossplane.io/v1alpha1
 kind: ProviderConfig
 metadata:
   name: default
 spec:
-  # Connection details for the Talos cluster
-  configuration:
-    source: Secret
-    secretRef:
-      namespace: crossplane-system
-      name: talos-credentials
-      key: credentials
+  credentials:
+    source: None
 ```
 
-Create a Secret containing your Talos client configuration:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: talos-credentials
-  namespace: crossplane-system
-type: Opaque
-stringData:
-  credentials: |
-    context: mycluster
-    contexts:
-      mycluster:
-        endpoints:
-          - 192.168.1.100
-        ca: LS0tLS1CRUdJTi0t...
-        crt: LS0tLS1CRUdJTi0t...
-        key: LS0tLS1CRUdJTi0t...
-```
+For machine API resources (ConfigurationApply, Bootstrap, Kubeconfig), supply
+the Talos client certificates directly on the managed resource via
+`spec.forProvider.clientConfiguration.{caCertificate,clientCertificate,clientKey}`.
+Use the literal value `insecure` on all three fields to target a machine in
+maintenance mode.
 
 ## Usage
 
@@ -131,13 +118,16 @@ make test
 
 ### Code Generation
 
-Generate code from the Terraform provider schema:
+Regenerate Crossplane managed resource scaffolding (deepcopy methods, managed
+resource interface implementations, CRDs):
 
 ```shell
 make generate
 ```
 
-This will update generated code in the `apis/` and `internal/` directories.
+This runs `controller-gen` and `angryjet` against the hand-written types in
+`apis/` and refreshes the `zz_generated.*` files plus the CRD manifests in
+`package/crds/`.
 
 ## Community
 
