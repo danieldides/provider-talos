@@ -28,6 +28,7 @@ Thumbs.db
 /main
 /provider
 /crossplane-*
+*.xpkg
 
 # Test and configuration files (should never be committed)
 talosconfig

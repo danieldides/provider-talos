@@ -48,20 +48,23 @@ kubectl get configurations.machine.talos.crossplane.io worker-config
 
 ### Step 4: Apply Configuration to Machine
 
-**Note:** Update the `node` field in `configurationapply.yaml` with your Talos machine IP.
+**Note:** Update the `node` field in the ConfigurationApply manifests with your Talos machine IP.
 
-For a machine in maintenance mode (no certificates yet):
+Two example manifests are provided. Both target machines in maintenance mode (using `clientConfiguration: insecure`); pick the one matching the role of the node you are provisioning:
+
+For a worker node:
 ```bash
-kubectl apply -f configurationapply-insecure.yaml
+kubectl apply -f configurationapply-worker.yaml
 ```
 
-For a configured machine (with certificates):
+For a controlplane node:
 ```bash
-# First, get the certificates from the Secrets resource
-kubectl get secrets.machine.talos.crossplane.io cluster-secrets -o yaml
+kubectl apply -f configurationapply-controlplane.yaml
+```
 
-# Update configurationapply.yaml with the certificates
-kubectl apply -f configurationapply.yaml
+For a node that already has certificates (configured mode), copy one of the manifests above and replace the `clientConfiguration` `caCertificate`, `clientCertificate`, and `clientKey` values with the ones produced by the Secrets resource:
+```bash
+kubectl get secrets.machine.talos.crossplane.io cluster-secrets -o yaml
 ```
 
 ## Verification

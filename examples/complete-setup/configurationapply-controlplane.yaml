@@ -1,0 +1,61 @@
+apiVersion: machine.talos.crossplane.io/v1alpha1
+kind: ConfigurationApply
+metadata:
+  name: apply-controlplane-config
+spec:
+  forProvider:
+    node: "192.168.120.87"
+    machineConfiguration:
+      version: v1alpha1
+      machine:
+        type: controlplane
+        token: "example-token-12345"
+        install:
+          disk: /dev/sda
+          image: factory.talos.dev/installer/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515:v1.8.0
+        ca:
+          crt: |
+            -----BEGIN CERTIFICATE-----
+            MIIBPzCB8qADAgECAhEAmHh6414RD+SnJxBansh/hDAFBgMrZXAwEDEOMAwGA1UE
+            ChMFdGFsb3MwHhcNMjUxMTA3MTkzNDE0WhcNMzUxMTA1MTkzNDE0WjAQMQ4wDAYD
+            VQQKEwV0YWxvczAqMAUGAytlcAMhAFhjxr30f9vBsPxBwYE1PrDNiJuzgIU4Not6
+            FRXiEIqRo2EwXzAOBgNVHQ8BAf8EBAMCAoQwHQYDVR0lBBYwFAYIKwYBBQUHAwEG
+            CCsGAQUFBwMCMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFOq5JdmgpvrLggMT
+            IUNS6tmk0LBfMAUGAytlcANBAFJp/DisFXYI9zAKg26Km0ZlU+QHbijl+ki085ug
+            9Bpl/v0TuJwIp9F8A4aHnZjRUYS+zVkgci1vfpl1V7mrhQ4=
+            -----END CERTIFICATE-----
+          key: |
+            -----BEGIN ED25519 PRIVATE KEY-----
+            MC4CAQAwBQYDK2VwBCIEIKZxOg8JsddM4RMeoXOQgJhnNOfKc2UTFeSuAVhrurMp
+            -----END ED25519 PRIVATE KEY-----
+      cluster:
+        id: "cluster-id-placeholder"
+        secret: "cluster-secret-placeholder"
+        token: "cluster-token-placeholder"
+        clusterName: demo-cluster
+        controlPlane:
+          endpoint: https://192.168.120.87:6443
+        network:
+          podSubnets:
+            - 10.244.0.0/16
+          serviceSubnets:
+            - 10.96.0.0/12
+        ca:
+          crt: |
+            -----BEGIN CERTIFICATE-----
+            MIIBijCCATCgAwIBAgIRAJk9Sabg76spXguw+SxKZCMwCgYIKoZIzj0EAwIwFTET
+            MBEGA1UEChMKa3ViZXJuZXRlczAeFw0yNTExMDcxOTM0MTRaFw0zNTExMDUxOTM0
+            MTRaMBUxEzARBgNVBAoTCmt1YmVybmV0ZXMwWTATBgcqhkjOPQIBBggqhkjOPQMB
+            BwNCAATgqgBpYvT0taXWwhaaJCkn6d9PNoFSjQWm5V87GK7QfT0HenFbvH4DUxvO
+            /ap6rsydOg56oCjN0MalxBmYZG6no2EwXzAOBgNVHQ8BAf8EBAMCAoQwHQYDVR0l
+            BBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
+            BBYEFCe/UWwIQE92NJ6+ckv6UwJujKTTMAoGCCqGSM49BAMCA0gAMEUCIQCHFp7x
+            Vmjypv2WEXOP8jI0JKYILvOYpmpJhKW349yQLgIgQ4Ms7n/Q4CSEdJGmnpsbkqG4
+            O0cQcD+4bdZKFlU4Ggw=
+            -----END CERTIFICATE-----
+    clientConfiguration:
+      caCertificate: "insecure"
+      clientCertificate: "insecure"
+      clientKey: "insecure"
+  providerConfigRef:
+    name: default
