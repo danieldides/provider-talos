@@ -19,6 +19,7 @@ package configurationapply
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"strings"
@@ -26,8 +27,6 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
@@ -381,20 +380,15 @@ func (c *external) canConnectInsecure(ctx context.Context, cr *v1alpha1.Configur
 
 // canConnectWithCreds checks if the machine accepts authenticated connections (configured mode)
 func (c *external) canConnectWithCreds(ctx context.Context, cr *v1alpha1.ConfigurationApply) bool {
-	clientConfig := cr.Spec.ForProvider.ClientConfiguration
 	endpoint := getConfigurationApplyEndpoint(cr)
 
-	cert, err := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
+	tlsConfig, err := buildConfigurationApplyTLSConfig(cr.Spec.ForProvider.ClientConfiguration, cr.Spec.ForProvider.Node)
 	if err != nil {
 		return false
 	}
 
 	talosClient, err := talosclient.New(ctx,
-		talosclient.WithGRPCDialOptions(grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ServerName:   cr.Spec.ForProvider.Node,
-			MinVersion:   tls.VersionTLS12,
-		}))),
+		talosclient.WithTLSConfig(tlsConfig),
 		talosclient.WithEndpoints(endpoint),
 	)
 	if err != nil {
@@ -427,43 +421,33 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 	clientConfig := cr.Spec.ForProvider.ClientConfiguration
 	endpoint := getConfigurationApplyEndpoint(cr)
 
-	var talosClient *talosclient.Client
-
-	if clientConfig.ClientCertificate == "" || clientConfig.ClientCertificate == "insecure" {
-		// Use insecure gRPC connection for machines in maintenance mode
-		fmt.Printf("Using insecure gRPC connection for maintenance mode machine\n")
-		talosClient, err = talosclient.New(ctx,
-			talosclient.WithEndpoints(endpoint),
-			talosclient.WithTLSConfig(&tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance mode machines
-			}),
-		)
-	} else {
-		// Create a certificate from the provided certificates
-		cert, certErr := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
-		if certErr != nil {
-			return errors.Wrap(certErr, "failed to create client certificate")
-		}
-
-		fmt.Printf("Using secure TLS connection with client certificates\n")
-		talosClient, err = talosclient.New(ctx,
-			talosclient.WithGRPCDialOptions(grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-				Certificates: []tls.Certificate{cert},
-				ServerName:   cr.Spec.ForProvider.Node, // Use node IP as server name
-				MinVersion:   tls.VersionTLS12,
-			}))),
-			talosclient.WithEndpoints(endpoint),
-		)
+	tlsConfig, err := buildConfigurationApplyTLSConfig(clientConfig, cr.Spec.ForProvider.Node)
+	if err != nil {
+		return err
 	}
+	if tlsConfig.InsecureSkipVerify {
+		fmt.Printf("Using insecure gRPC connection for maintenance mode machine\n")
+	} else {
+		fmt.Printf("Using secure TLS connection with client certificates\n")
+	}
+	talosClient, err := talosclient.New(ctx,
+		talosclient.WithTLSConfig(tlsConfig),
+		talosclient.WithEndpoints(endpoint),
+	)
 	if err != nil {
 		return errors.Wrap(err, "failed to create Talos client")
 	}
 	defer talosClient.Close() // nolint:errcheck
 
 	// Apply the configuration to the node
+	mode, err := getConfigurationApplyMode(cr.Spec.ForProvider.ApplyMode)
+	if err != nil {
+		return err
+	}
+
 	_, err = talosClient.ApplyConfiguration(ctx, &machine.ApplyConfigurationRequest{
 		Data: []byte(configInput),
-		Mode: machine.ApplyConfigurationRequest_REBOOT, // Required for maintenance mode
+		Mode: mode,
 	})
 	if err != nil {
 		return errors.Wrap(err, "failed to apply configuration to Talos node")
@@ -473,6 +457,35 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 	return nil
 }
 
+func buildConfigurationApplyTLSConfig(clientConfig v1alpha1.ClientConfiguration, node string) (*tls.Config, error) {
+	if clientConfig.ClientCertificate == "" || clientConfig.ClientCertificate == "insecure" {
+		return &tls.Config{
+			InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance mode machines.
+		}, nil
+	}
+
+	cert, err := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create client certificate")
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ServerName:   node,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	if clientConfig.CACertificate != "" && clientConfig.CACertificate != "insecure" {
+		roots := x509.NewCertPool()
+		if ok := roots.AppendCertsFromPEM([]byte(clientConfig.CACertificate)); !ok {
+			return nil, errors.New("failed to parse CA certificate")
+		}
+		tlsConfig.RootCAs = roots
+	}
+
+	return tlsConfig, nil
+}
+
 func getConfigurationApplyEndpoint(cr *v1alpha1.ConfigurationApply) string {
 	endpoint := cr.Spec.ForProvider.Node + ":50000"
 	if cr.Spec.ForProvider.Endpoint != nil && *cr.Spec.ForProvider.Endpoint != "" {
@@ -480,6 +493,23 @@ func getConfigurationApplyEndpoint(cr *v1alpha1.ConfigurationApply) string {
 	}
 
 	return endpoint
+}
+
+func getConfigurationApplyMode(applyMode *string) (machine.ApplyConfigurationRequest_Mode, error) {
+	if applyMode == nil || *applyMode == "" || *applyMode == "reboot" {
+		return machine.ApplyConfigurationRequest_REBOOT, nil
+	}
+
+	switch *applyMode {
+	case "auto":
+		return machine.ApplyConfigurationRequest_AUTO, nil
+	case "no_reboot":
+		return machine.ApplyConfigurationRequest_NO_REBOOT, nil
+	case "staged":
+		return machine.ApplyConfigurationRequest_STAGED, nil
+	default:
+		return machine.ApplyConfigurationRequest_REBOOT, errors.Errorf("unknown configuration apply mode %q", *applyMode)
+	}
 }
 
 // generateMachineConfigurationYAML converts structured configuration to Talos machine configuration YAML
