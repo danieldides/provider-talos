@@ -18,9 +18,18 @@ package configurationapply
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 
 	v1alpha1 "github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
@@ -69,6 +78,149 @@ func TestObserve(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.want.o, got); diff != "" {
 				t.Errorf("\n%s\ne.Observe(...): -want, +got:\n%s\n", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestGetConfigurationApplyMode(t *testing.T) {
+	empty := ""
+	reboot := "reboot"
+	auto := "auto"
+	noReboot := "no_reboot"
+	staged := "staged"
+	unknown := "unknown"
+
+	tests := map[string]struct {
+		applyMode *string
+		want      machine.ApplyConfigurationRequest_Mode
+		wantErr   bool
+	}{
+		"NilDefaultsToReboot": {
+			want: machine.ApplyConfigurationRequest_REBOOT,
+		},
+		"EmptyDefaultsToReboot": {
+			applyMode: &empty,
+			want:      machine.ApplyConfigurationRequest_REBOOT,
+		},
+		"Reboot": {
+			applyMode: &reboot,
+			want:      machine.ApplyConfigurationRequest_REBOOT,
+		},
+		"Auto": {
+			applyMode: &auto,
+			want:      machine.ApplyConfigurationRequest_AUTO,
+		},
+		"NoReboot": {
+			applyMode: &noReboot,
+			want:      machine.ApplyConfigurationRequest_NO_REBOOT,
+		},
+		"Staged": {
+			applyMode: &staged,
+			want:      machine.ApplyConfigurationRequest_STAGED,
+		},
+		"UnknownErrors": {
+			applyMode: &unknown,
+			want:      machine.ApplyConfigurationRequest_REBOOT,
+			wantErr:   true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := getConfigurationApplyMode(tc.applyMode)
+			if tc.wantErr && err == nil {
+				t.Fatal("getConfigurationApplyMode(...): expected error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("getConfigurationApplyMode(...): unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("getConfigurationApplyMode(...): -want, +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestBuildConfigurationApplyTLSConfig(t *testing.T) {
+	caCert, clientCert, clientKey := generateTestCertificates(t)
+
+	tests := map[string]struct {
+		clientConfig v1alpha1.ClientConfiguration
+		node         string
+		check        func(t *testing.T, cfg *tls.Config)
+		wantErr      bool
+	}{
+		"InsecureEmptyClientCertificate": {
+			clientConfig: v1alpha1.ClientConfiguration{},
+			check: func(t *testing.T, cfg *tls.Config) {
+				t.Helper()
+				if !cfg.InsecureSkipVerify {
+					t.Fatal("buildConfigurationApplyTLSConfig(...): InsecureSkipVerify = false")
+				}
+			},
+		},
+		"InsecureClientCertificateValue": {
+			clientConfig: v1alpha1.ClientConfiguration{ClientCertificate: "insecure"},
+			check: func(t *testing.T, cfg *tls.Config) {
+				t.Helper()
+				if !cfg.InsecureSkipVerify {
+					t.Fatal("buildConfigurationApplyTLSConfig(...): InsecureSkipVerify = false")
+				}
+			},
+		},
+		"SecureWithCA": {
+			clientConfig: v1alpha1.ClientConfiguration{
+				CACertificate:     caCert,
+				ClientCertificate: clientCert,
+				ClientKey:         clientKey,
+			},
+			node: "127.0.0.1",
+			check: func(t *testing.T, cfg *tls.Config) {
+				t.Helper()
+				if len(cfg.Certificates) != 1 {
+					t.Fatalf("buildConfigurationApplyTLSConfig(...): got %d certificates, want 1", len(cfg.Certificates))
+				}
+				if cfg.RootCAs == nil {
+					t.Fatal("buildConfigurationApplyTLSConfig(...): RootCAs = nil")
+				}
+				if diff := cmp.Diff("127.0.0.1", cfg.ServerName); diff != "" {
+					t.Errorf("buildConfigurationApplyTLSConfig(...).ServerName: -want, +got:\n%s", diff)
+				}
+				if diff := cmp.Diff(uint16(tls.VersionTLS12), cfg.MinVersion); diff != "" {
+					t.Errorf("buildConfigurationApplyTLSConfig(...).MinVersion: -want, +got:\n%s", diff)
+				}
+			},
+		},
+		"InvalidCAErrors": {
+			clientConfig: v1alpha1.ClientConfiguration{
+				CACertificate:     "invalid",
+				ClientCertificate: clientCert,
+				ClientKey:         clientKey,
+			},
+			wantErr: true,
+		},
+		"InvalidClientCertificateErrors": {
+			clientConfig: v1alpha1.ClientConfiguration{
+				CACertificate:     caCert,
+				ClientCertificate: "invalid",
+				ClientKey:         clientKey,
+			},
+			wantErr: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := buildConfigurationApplyTLSConfig(tc.clientConfig, tc.node)
+			if tc.wantErr && err == nil {
+				t.Fatal("buildConfigurationApplyTLSConfig(...): expected error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("buildConfigurationApplyTLSConfig(...): unexpected error: %v", err)
+			}
+			if tc.check != nil {
+				tc.check(t, got)
 			}
 		})
 	}
@@ -123,4 +275,50 @@ func TestGetConfigurationApplyEndpoint(t *testing.T) {
 			}
 		})
 	}
+}
+
+func generateTestCertificates(t *testing.T) (string, string, string) {
+	t.Helper()
+
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey(...): %v", err)
+	}
+
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate(...): %v", err)
+	}
+
+	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey(...): %v", err)
+	}
+	clientTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "test-client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, caTemplate, &clientKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate(...): %v", err)
+	}
+
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	clientCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientDER})
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
+
+	return string(caPEM), string(clientCertPEM), string(clientKeyPEM)
 }
