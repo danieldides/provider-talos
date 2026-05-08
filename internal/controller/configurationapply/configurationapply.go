@@ -40,6 +40,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
@@ -181,49 +182,35 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	// Check the actual state of the machine
 	machineState := c.checkMachineState(ctx, cr)
+	applied := resolveAppliedStatus(cr)
 
 	// Update status with detected machine state
 	now := metav1.Now()
 	cr.Status.AtProvider.MachineState = string(machineState)
 	cr.Status.AtProvider.LastStateCheck = &now
 
-	// Check if we have a valid machine configuration from structured fields
-	hasValidConfig := cr.Spec.ForProvider.MachineConfiguration.Version != "" &&
-		cr.Spec.ForProvider.MachineConfiguration.Machine.Type != "" &&
-		cr.Spec.ForProvider.MachineConfiguration.Machine.Token != "" &&
-		cr.Spec.ForProvider.MachineConfiguration.Cluster.ID != ""
-
-	// Determine resource state based on machine state
-	var resourceExists, resourceUpToDate bool
+	resourceExists, resourceUpToDate := observationState(machineState, applied, hasValidMachineConfig(cr))
 
 	switch machineState {
 	case MachineStateMaintenanceMode:
-		// Machine is in maintenance mode - configuration needs to be applied
-		resourceExists = false
-		resourceUpToDate = false
-		cr.Status.AtProvider.Applied = false
-		fmt.Printf("Machine %s in maintenance mode - configuration not applied\n", cr.Spec.ForProvider.Node)
+		if applied {
+			cr.SetConditions(xpv1.Available())
+			fmt.Printf("Machine %s in maintenance mode but configuration was applied\n", cr.Spec.ForProvider.Node)
+		} else {
+			cr.Status.AtProvider.Applied = false
+			fmt.Printf("Machine %s in maintenance mode - configuration not applied\n", cr.Spec.ForProvider.Node)
+		}
 
 	case MachineStateConfigured:
-		// Machine is configured and running - verified with authenticated connection
-		resourceExists = true
-		resourceUpToDate = hasValidConfig
 		cr.Status.AtProvider.Applied = true
 		cr.SetConditions(xpv1.Available())
 		fmt.Printf("Machine %s is configured and running\n", cr.Spec.ForProvider.Node)
 
 	case MachineStateUnreachable:
-		// Machine is unreachable - could be installing or failed
-		if cr.Status.AtProvider.Applied {
-			// We previously applied config - assume it's installing/rebooting (expected)
-			resourceExists = true
-			resourceUpToDate = hasValidConfig
+		if applied {
 			cr.SetConditions(xpv1.Available())
 			fmt.Printf("Machine %s unreachable but configuration was applied - likely installing\n", cr.Spec.ForProvider.Node)
 		} else {
-			// Never applied config and unreachable - needs configuration
-			resourceExists = false
-			resourceUpToDate = false
 			fmt.Printf("Machine %s unreachable and configuration not applied\n", cr.Spec.ForProvider.Node)
 		}
 	}
@@ -233,6 +220,45 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceUpToDate:  resourceUpToDate,
 		ConnectionDetails: managed.ConnectionDetails{},
 	}, nil
+}
+
+func resolveAppliedStatus(cr *v1alpha1.ConfigurationApply) bool {
+	applied := cr.Status.AtProvider.Applied || hasSuccessfulExternalCreate(cr)
+	if applied && !cr.Status.AtProvider.Applied {
+		cr.Status.AtProvider.Applied = true
+	}
+	if applied && cr.Status.AtProvider.LastAppliedTime == nil {
+		if t := meta.GetExternalCreateSucceeded(cr); !t.IsZero() {
+			lastApplied := metav1.NewTime(t)
+			cr.Status.AtProvider.LastAppliedTime = &lastApplied
+		}
+	}
+
+	return applied
+}
+
+func hasValidMachineConfig(cr *v1alpha1.ConfigurationApply) bool {
+	return cr.Spec.ForProvider.MachineConfiguration.Version != "" &&
+		cr.Spec.ForProvider.MachineConfiguration.Machine.Type != "" &&
+		cr.Spec.ForProvider.MachineConfiguration.Machine.Token != "" &&
+		cr.Spec.ForProvider.MachineConfiguration.Cluster.ID != ""
+}
+
+func observationState(machineState MachineState, applied, hasValidConfig bool) (bool, bool) {
+	switch machineState {
+	case MachineStateMaintenanceMode:
+		return applied, applied && hasValidConfig
+	case MachineStateConfigured:
+		return true, hasValidConfig
+	case MachineStateUnreachable:
+		return applied, applied && hasValidConfig
+	}
+
+	return false, false
+}
+
+func hasSuccessfulExternalCreate(cr *v1alpha1.ConfigurationApply) bool {
+	return cr.GetAnnotations()[meta.AnnotationKeyExternalCreateSucceeded] != ""
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
@@ -251,7 +277,8 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	// Update status
 	cr.Status.AtProvider.Applied = true
-	// Note: LastAppliedTime field doesn't exist in the generated API, skipping
+	now := metav1.Now()
+	cr.Status.AtProvider.LastAppliedTime = &now
 
 	// Set Ready condition since configuration was successfully applied
 	cr.SetConditions(xpv1.Available())
@@ -279,7 +306,8 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	// Update status
 	cr.Status.AtProvider.Applied = true
-	// Note: LastAppliedTime field doesn't exist in the generated API, skipping
+	now := metav1.Now()
+	cr.Status.AtProvider.LastAppliedTime = &now
 
 	return managed.ExternalUpdate{
 		ConnectionDetails: managed.ConnectionDetails{},

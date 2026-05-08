@@ -42,6 +42,8 @@ import (
 	"github.com/crossplane-contrib/provider-talos/internal/features"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/role"
 )
 
 const (
@@ -327,6 +329,10 @@ func (c *external) generateMachineSecrets(talosVersion *string) (*GeneratedSecre
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate secrets bundle")
 	}
+	clientCertificate, err := secretsBundle.GenerateTalosAPIClientCertificateWithTTL(role.MakeSet(role.Admin), constants.TalosAPIDefaultCertificateValidityDuration)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to generate Talos API client certificate")
+	}
 
 	// Extract cluster secrets as JSON
 	clusterSecretsData := map[string]interface{}{
@@ -369,8 +375,8 @@ func (c *external) generateMachineSecrets(talosVersion *string) (*GeneratedSecre
 		"contexts": map[string]interface{}{
 			"default": map[string]interface{}{
 				"ca":  string(secretsBundle.Certs.OS.Crt),
-				"crt": string(secretsBundle.Certs.OS.Crt),
-				"key": string(secretsBundle.Certs.OS.Key),
+				"crt": string(clientCertificate.Crt),
+				"key": string(clientCertificate.Key),
 			},
 		},
 	}
@@ -384,8 +390,8 @@ func (c *external) generateMachineSecrets(talosVersion *string) (*GeneratedSecre
 		KubernetesSecrets: string(kubernetesSecretsJSON),
 		TrustdInfo:        string(trustdInfoJSON),
 		CACertificate:     string(secretsBundle.Certs.OS.Crt),
-		ClientCertificate: string(secretsBundle.Certs.OS.Crt),
-		ClientKey:         string(secretsBundle.Certs.OS.Key),
+		ClientCertificate: string(clientCertificate.Crt),
+		ClientKey:         string(clientCertificate.Key),
 		TalosConfig:       talosConfigBytes,
 	}, nil
 }

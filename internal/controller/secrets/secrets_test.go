@@ -18,6 +18,9 @@ package secrets
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -71,4 +74,79 @@ func TestObserve(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGenerateMachineSecretsUsesAdminClientCertificate(t *testing.T) {
+	generated, err := (&external{}).generateMachineSecrets(nil)
+	if err != nil {
+		t.Fatalf("generateMachineSecrets(...): unexpected error: %v", err)
+	}
+
+	if generated.ClientCertificate == generated.CACertificate {
+		t.Fatal("ClientCertificate matches CACertificate, want generated leaf certificate")
+	}
+
+	clientCert := parseCertificate(t, generated.ClientCertificate)
+	if clientCert.IsCA {
+		t.Fatal("ClientCertificate IsCA = true, want false")
+	}
+	if diff := cmp.Diff([]string{"os:admin"}, clientCert.Subject.Organization); diff != "" {
+		t.Errorf("ClientCertificate Subject.Organization: -want, +got:\n%s", diff)
+	}
+	if !hasClientAuthUsage(clientCert) {
+		t.Fatal("ClientCertificate missing ExtKeyUsageClientAuth")
+	}
+
+	caCert := parseCertificate(t, generated.CACertificate)
+	roots := x509.NewCertPool()
+	roots.AddCert(caCert)
+	if _, err := clientCert.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		t.Fatalf("ClientCertificate did not verify against CACertificate: %v", err)
+	}
+
+	var talosConfig struct {
+		Contexts map[string]struct {
+			CA  string `json:"ca"`
+			Crt string `json:"crt"`
+			Key string `json:"key"`
+		} `json:"contexts"`
+	}
+	if err := json.Unmarshal(generated.TalosConfig, &talosConfig); err != nil {
+		t.Fatalf("TalosConfig JSON unmarshal failed: %v", err)
+	}
+	ctx, ok := talosConfig.Contexts["default"]
+	if !ok {
+		t.Fatal("TalosConfig missing default context")
+	}
+	if diff := cmp.Diff(generated.CACertificate, ctx.CA); diff != "" {
+		t.Errorf("TalosConfig CA: -want, +got:\n%s", diff)
+	}
+	if diff := cmp.Diff(generated.ClientCertificate, ctx.Crt); diff != "" {
+		t.Errorf("TalosConfig client certificate: -want, +got:\n%s", diff)
+	}
+	if diff := cmp.Diff(generated.ClientKey, ctx.Key); diff != "" {
+		t.Errorf("TalosConfig client key: -want, +got:\n%s", diff)
+	}
+}
+
+func parseCertificate(t *testing.T, certPEM string) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		t.Fatal("failed to decode certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("failed to parse certificate: %v", err)
+	}
+	return cert
+}
+
+func hasClientAuthUsage(cert *x509.Certificate) bool {
+	for _, usage := range cert.ExtKeyUsage {
+		if usage == x509.ExtKeyUsageClientAuth {
+			return true
+		}
+	}
+	return false
 }
