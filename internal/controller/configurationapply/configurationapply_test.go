@@ -28,8 +28,12 @@ import (
 	"testing"
 	"time"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/google/go-cmp/cmp"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1alpha1 "github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
@@ -80,6 +84,104 @@ func TestObserve(t *testing.T) {
 				t.Errorf("\n%s\ne.Observe(...): -want, +got:\n%s\n", tc.reason, diff)
 			}
 		})
+	}
+}
+
+func TestObserveUnreachableWithSuccessfulExternalCreate(t *testing.T) {
+	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	cr := testConfigurationApply()
+	meta.SetExternalCreateSucceeded(cr, createdAt)
+
+	e := external{canConnectInsecureFn: func(context.Context, *v1alpha1.ConfigurationApply) bool { return false }}
+	got, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Observe(...): unexpected error: %v", err)
+	}
+
+	if !got.ResourceExists {
+		t.Fatal("e.Observe(...).ResourceExists = false, want true")
+	}
+	if !got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = false, want true")
+	}
+	if !cr.Status.AtProvider.Applied {
+		t.Fatal("cr.Status.AtProvider.Applied = false, want true")
+	}
+	if cr.Status.AtProvider.LastAppliedTime == nil || !cr.Status.AtProvider.LastAppliedTime.Time.Equal(createdAt) {
+		t.Fatalf("cr.Status.AtProvider.LastAppliedTime = %v, want %v", cr.Status.AtProvider.LastAppliedTime, createdAt)
+	}
+	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got != corev1.ConditionTrue {
+		t.Fatalf("Ready condition status = %s, want %s", got, corev1.ConditionTrue)
+	}
+}
+
+func TestObserveUnreachableWithoutSuccessfulExternalCreate(t *testing.T) {
+	cr := testConfigurationApply()
+	e := external{canConnectInsecureFn: func(context.Context, *v1alpha1.ConfigurationApply) bool { return false }}
+
+	got, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Observe(...): unexpected error: %v", err)
+	}
+
+	if got.ResourceExists {
+		t.Fatal("e.Observe(...).ResourceExists = true, want false")
+	}
+	if got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = true, want false")
+	}
+	if cr.Status.AtProvider.Applied {
+		t.Fatal("cr.Status.AtProvider.Applied = true, want false")
+	}
+}
+
+func TestObserveMaintenanceModeKeepsSuccessfulExternalCreate(t *testing.T) {
+	cr := testConfigurationApply()
+	meta.SetExternalCreateSucceeded(cr, time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC))
+	e := external{canConnectInsecureFn: func(context.Context, *v1alpha1.ConfigurationApply) bool { return true }}
+
+	got, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Observe(...): unexpected error: %v", err)
+	}
+
+	if !got.ResourceExists {
+		t.Fatal("e.Observe(...).ResourceExists = false, want true")
+	}
+	if !got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = false, want true")
+	}
+	if !cr.Status.AtProvider.Applied {
+		t.Fatal("cr.Status.AtProvider.Applied = false, want true")
+	}
+}
+
+func testConfigurationApply() *v1alpha1.ConfigurationApply {
+	return &v1alpha1.ConfigurationApply{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-apply"},
+		Spec: v1alpha1.ConfigurationApplySpec{ForProvider: v1alpha1.ConfigurationApplyParameters{
+			Node: "127.0.0.1",
+			MachineConfiguration: v1alpha1.MachineConfigurationSpec{
+				Version: "v1alpha1",
+				Machine: v1alpha1.MachineSpec{
+					Type:  "controlplane",
+					Token: "machine-token",
+					Install: v1alpha1.InstallSpec{
+						Disk:  "/dev/sda",
+						Image: "ghcr.io/siderolabs/installer:v1.11.0",
+					},
+				},
+				Cluster: v1alpha1.ClusterSpec{
+					ID:          "cluster-id",
+					Secret:      "cluster-secret",
+					ClusterName: "test-cluster",
+					ControlPlane: v1alpha1.ControlPlaneSpec{
+						Endpoint: "https://127.0.0.1:6443",
+					},
+					Token: "cluster-token",
+				},
+			},
+		}},
 	}
 }
 
