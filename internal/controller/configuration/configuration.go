@@ -21,7 +21,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
@@ -50,6 +49,7 @@ import (
 
 	machinev1alpha1 "github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 	apisv1alpha1 "github.com/crossplane-contrib/provider-talos/apis/v1alpha1"
+	secretscontroller "github.com/crossplane-contrib/provider-talos/internal/controller/secrets"
 	"github.com/crossplane-contrib/provider-talos/internal/features"
 )
 
@@ -184,8 +184,6 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.New(errNotConfiguration)
 	}
 
-	fmt.Printf("Observing Configuration: %s\n", cr.Name)
-
 	// Configuration is a local resource - it generates config locally
 	// Always consider it as existing since we can generate it anytime
 	machineConfig, err := c.generateMachineConfiguration(ctx, cr)
@@ -203,8 +201,6 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	// Set Ready condition
 	cr.SetConditions(xpv1.Available())
 
-	fmt.Printf("Configuration generated successfully (length: %d)\n", len(machineConfig))
-
 	return managed.ExternalObservation{
 		ResourceExists:    true,
 		ResourceUpToDate:  true,
@@ -213,12 +209,10 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
-	cr, ok := mg.(*machinev1alpha1.Configuration)
+	_, ok := mg.(*machinev1alpha1.Configuration)
 	if !ok {
 		return managed.ExternalCreation{}, errors.New(errNotConfiguration)
 	}
-
-	fmt.Printf("Creating Configuration: %s (no-op for local resource)\n", cr.Name)
 
 	// Configuration is generated in Observe - Create is a no-op
 	return managed.ExternalCreation{
@@ -227,12 +221,10 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 }
 
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
-	cr, ok := mg.(*machinev1alpha1.Configuration)
+	_, ok := mg.(*machinev1alpha1.Configuration)
 	if !ok {
 		return managed.ExternalUpdate{}, errors.New(errNotConfiguration)
 	}
-
-	fmt.Printf("Updating Configuration: %s (no-op for local resource)\n", cr.Name)
 
 	// Configuration is regenerated in Observe - Update is a no-op
 	return managed.ExternalUpdate{
@@ -241,17 +233,14 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 }
 
 func (c *external) Delete(ctx context.Context, mg resource.Managed) (managed.ExternalDelete, error) {
-	cr, ok := mg.(*machinev1alpha1.Configuration)
+	_, ok := mg.(*machinev1alpha1.Configuration)
 	if !ok {
 		return managed.ExternalDelete{}, errors.New(errNotConfiguration)
 	}
 
-	fmt.Printf("Deleting Configuration: %s\n", cr.Name)
-
 	// For Talos configurations, deletion typically means resetting to a default config
 	// or removing custom configurations. The exact behavior depends on requirements.
 	// For now, we'll log the deletion without taking action on the machine.
-	fmt.Printf("Configuration deletion logged - no action taken on Talos machine\n")
 
 	return managed.ExternalDelete{}, nil
 }
@@ -363,9 +352,16 @@ func (c *external) getMachineSecretsBundle(ctx context.Context, cr *machinev1alp
 	if err := c.kube.Get(ctx, types.NamespacedName{Name: cr.Spec.ForProvider.MachineSecretsRef.Name}, secretsResource); err != nil {
 		return nil, errors.Wrap(err, "cannot get referenced machine secrets")
 	}
+	if secretsResource.Status.AtProvider.MachineSecrets == nil {
+		return nil, errors.New("referenced machine secrets do not contain generated data")
+	}
 
-	if secretsResource.Status.AtProvider.MachineSecrets == nil || secretsResource.Status.AtProvider.MachineSecrets.Bundle == "" {
-		return nil, errors.New("referenced machine secrets do not contain a generated bundle")
+	if secretsResource.Status.AtProvider.MachineSecrets.Structured != nil {
+		return secretscontroller.MachineSecretsToSecretsBundle(secretsResource.Status.AtProvider.MachineSecrets.Structured)
+	}
+
+	if secretsResource.Status.AtProvider.MachineSecrets.Bundle == "" {
+		return nil, errors.New("referenced machine secrets do not contain structured data or a generated bundle")
 	}
 
 	bundle := &talossecrets.Bundle{Clock: talossecrets.NewClock()}

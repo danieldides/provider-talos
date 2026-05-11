@@ -13,3 +13,6 @@ spec:
     talosVersion: v1.8.0
   providerConfigRef:
     name: default
+  writeConnectionSecretToRef:
+    name: worker-machine-configuration
+    namespace: default

@@ -52,10 +52,16 @@ This demonstrates the full lifecycle:
 ## Usage Notes
 
 ### Certificate Management
-Most examples show placeholder certificate values (`LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t...`). In practice, these should:
+The `Secrets` resource owns the Talos machine secrets bundle. Compositions should pass a `machineSecretsRef` from `Configuration` to `Secrets` instead of reconstructing individual certificate fields.
 
-1. **For Secrets resources**: Be generated automatically and stored in connection secrets
-2. **For other resources**: Reference the actual certificate data from the secrets
+Canonical `Secrets` connection detail keys are:
+
+1. `machine_secrets` - structured JSON with cluster, trustd, encryption, and cert/key fields. Certificate and key values are base64-encoded PEM strings.
+2. `machine_secrets_bundle` - raw Talos SDK bundle JSON retained for compatibility.
+3. `client_configuration` - JSON with base64-encoded `caCertificate`, `clientCertificate`, and `clientKey` values.
+4. `ca_certificate`, `client_certificate`, and `client_key` - raw PEM values retained for existing consumers.
+
+The generated `client_certificate` is an admin Talos API client certificate signed by the OS CA. It is not the OS CA certificate itself.
 
 ### Example Certificate Extraction
 ```bash
@@ -63,6 +69,7 @@ Most examples show placeholder certificate values (`LS0tLS1CRUdJTiBDRVJUSUZJQ0FU
 kubectl get secret talos-cluster-secrets -o jsonpath='{.data.ca_certificate}' | base64 -d
 kubectl get secret talos-cluster-secrets -o jsonpath='{.data.client_certificate}' | base64 -d  
 kubectl get secret talos-cluster-secrets -o jsonpath='{.data.client_key}' | base64 -d
+kubectl get secret talos-cluster-secrets -o jsonpath='{.data.machine_secrets}' | base64 -d
 ```
 
 ### Network Configuration
