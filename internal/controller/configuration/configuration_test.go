@@ -18,13 +18,22 @@ package configuration
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	talossecrets "github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/pkg/test"
+
+	machinev1alpha1 "github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 )
 
 // Unlike many Kubernetes projects Crossplane does not use third party testing
@@ -70,5 +79,92 @@ func TestObserve(t *testing.T) {
 				t.Errorf("\n%s\ne.Observe(...): -want, +got:\n%s\n", tc.reason, diff)
 			}
 		})
+	}
+}
+
+func TestObservePublishesMachineConfiguration(t *testing.T) {
+	t.Parallel()
+
+	bundle, err := talossecrets.NewBundle(talossecrets.NewClock(), nil)
+	if err != nil {
+		t.Fatalf("talossecrets.NewBundle(...): %v", err)
+	}
+	bundleJSON, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatalf("json.Marshal(...): %v", err)
+	}
+
+	scheme := runtime.NewScheme()
+	if err := machinev1alpha1.SchemeBuilder.AddToScheme(scheme); err != nil {
+		t.Fatalf("machinev1alpha1.SchemeBuilder.AddToScheme(...): %v", err)
+	}
+
+	machineSecrets := &machinev1alpha1.Secrets{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-machine-secrets"},
+		Status: machinev1alpha1.SecretsStatus{AtProvider: machinev1alpha1.SecretsObservation{
+			MachineSecrets: &machinev1alpha1.MachineSecretsData{Bundle: string(bundleJSON)},
+		}},
+	}
+
+	configuration := &machinev1alpha1.Configuration{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-config"},
+		Spec: machinev1alpha1.ConfigurationSpec{ForProvider: machinev1alpha1.ConfigurationParameters{
+			ClusterName:       "example-cluster",
+			ClusterEndpoint:   "https://10.0.0.1:6443",
+			MachineType:       "worker",
+			MachineSecretsRef: &xpv1.Reference{Name: machineSecrets.Name},
+			ConfigPatches: []string{`machine:
+  nodeLabels:
+    environment: production`},
+		}},
+	}
+
+	e := external{kube: fake.NewClientBuilder().WithScheme(scheme).WithObjects(machineSecrets).Build()}
+	got, err := e.Observe(context.Background(), configuration)
+	if err != nil {
+		t.Fatalf("e.Observe(...): %v", err)
+	}
+
+	machineConfig := string(got.ConnectionDetails[connectionKeyMachineConfiguration])
+	if machineConfig == "" {
+		t.Fatal("expected machine configuration connection detail")
+	}
+	for _, want := range []string{"clusterName: example-cluster", "type: worker", "environment: production"} {
+		if !strings.Contains(machineConfig, want) {
+			t.Fatalf("expected generated machine configuration to contain %q", want)
+		}
+	}
+	if configuration.Status.AtProvider.MachineConfiguration != machineConfig {
+		t.Fatal("expected status machine configuration to match connection detail")
+	}
+	if configuration.Status.AtProvider.MachineConfigurationHash == "" {
+		t.Fatal("expected machine configuration hash in status")
+	}
+	if configuration.Status.AtProvider.GeneratedTime == nil {
+		t.Fatal("expected generated time in status")
+	}
+	if !got.ResourceExists || !got.ResourceUpToDate {
+		t.Fatalf("expected existing and up to date resource, got %+v", got)
+	}
+}
+
+func TestObserveRequiresMachineSecretsRef(t *testing.T) {
+	t.Parallel()
+
+	configuration := &machinev1alpha1.Configuration{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-config"},
+		Spec: machinev1alpha1.ConfigurationSpec{ForProvider: machinev1alpha1.ConfigurationParameters{
+			ClusterName:     "example-cluster",
+			ClusterEndpoint: "https://10.0.0.1:6443",
+			MachineType:     "worker",
+		}},
+	}
+
+	_, err := (&external{}).Observe(context.Background(), configuration)
+	if err == nil {
+		t.Fatal("e.Observe(...): expected error")
+	}
+	if !strings.Contains(err.Error(), "machineSecretsRef is required") {
+		t.Fatalf("e.Observe(...): expected machineSecretsRef required error, got %v", err)
 	}
 }

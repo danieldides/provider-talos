@@ -18,14 +18,25 @@ package configuration
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
 	"github.com/pkg/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	talosconfig "github.com/siderolabs/talos/pkg/machinery/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
+	"github.com/siderolabs/talos/pkg/machinery/config/generate"
+	talossecrets "github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
+	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
 
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
@@ -49,6 +60,8 @@ const (
 	errGetCreds         = "cannot get credentials"
 
 	errNewClient = "cannot create new Service"
+
+	connectionKeyMachineConfiguration = "machine_configuration"
 )
 
 // TalosConfigurationService manages Talos machine configurations
@@ -155,12 +168,13 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errNewClient)
 	}
 
-	return &external{service: svc.(*TalosConfigurationService)}, nil
+	return &external{kube: c.kube, service: svc.(*TalosConfigurationService)}, nil
 }
 
 // An ExternalClient observes, then either creates, updates, or deletes an
 // external resource to ensure it reflects the managed resource's desired state.
 type external struct {
+	kube    client.Client
 	service *TalosConfigurationService
 }
 
@@ -181,6 +195,10 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	// Update status with generated configuration
 	cr.Status.AtProvider.MachineConfiguration = machineConfig
+	now := metav1.Now()
+	cr.Status.AtProvider.GeneratedTime = &now
+	hash := sha256.Sum256([]byte(machineConfig))
+	cr.Status.AtProvider.MachineConfigurationHash = hex.EncodeToString(hash[:])
 
 	// Set Ready condition
 	cr.SetConditions(xpv1.Available())
@@ -190,7 +208,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	return managed.ExternalObservation{
 		ResourceExists:    true,
 		ResourceUpToDate:  true,
-		ConnectionDetails: managed.ConnectionDetails{},
+		ConnectionDetails: managed.ConnectionDetails{connectionKeyMachineConfiguration: []byte(machineConfig)},
 	}, nil
 }
 
@@ -243,137 +261,118 @@ func (c *external) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-// generateMachineConfiguration generates a Talos machine configuration based on the provided spec
-//
-//nolint:unparam // Error return type maintained for future error handling
-func (c *external) generateMachineConfiguration(_ context.Context, cr *machinev1alpha1.Configuration) (string, error) {
-	// Get cluster name - use default if not provided
+// generateMachineConfiguration renders Talos machine configuration with the Talos SDK.
+func (c *external) generateMachineConfiguration(ctx context.Context, cr *machinev1alpha1.Configuration) (string, error) {
+	clusterName, clusterEndpoint, kubernetesVersion := configurationInput(cr)
+	options, err := c.generationOptions(ctx, cr)
+	if err != nil {
+		return "", err
+	}
+
+	input, err := generate.NewInput(clusterName, clusterEndpoint, kubernetesVersion, options...)
+	if err != nil {
+		return "", err
+	}
+
+	machineType, err := machine.ParseType(cr.Spec.ForProvider.MachineType)
+	if err != nil {
+		return "", err
+	}
+
+	config, err := input.Config(machineType)
+	if err != nil {
+		return "", err
+	}
+
+	return renderMachineConfig(config, cr.Spec.ForProvider.ConfigPatches)
+}
+
+func configurationInput(cr *machinev1alpha1.Configuration) (string, string, string) {
 	clusterName := "talos-cluster"
 	if cr.Spec.ForProvider.ClusterName != "" {
 		clusterName = cr.Spec.ForProvider.ClusterName
 	}
 
-	// Get cluster endpoint - use provided endpoint or default
 	clusterEndpoint := "https://192.168.120.83:6443"
 	if cr.Spec.ForProvider.ClusterEndpoint != "" {
 		clusterEndpoint = cr.Spec.ForProvider.ClusterEndpoint
 	}
 
-	// For now, generate a basic working Talos configuration
-	// This is a minimal control plane configuration that will work with the machine
-	machineConfig := fmt.Sprintf(`# Talos machine configuration
-version: v1alpha1
-debug: false
-persist: true
-machine:
-  type: controlplane
-  token: wlzjnq.6ac5m9oibqwlkuuy
-  ca:
-    crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t
-    key: LS0tLS1CRUdJTiBFRDI1NTE5IFBSSVZBVEUgS0VZLS0tLS0=
-  certSANs: []
-  kubelet:
-    image: ghcr.io/siderolabs/kubelet:v1.30.7
-    defaultRuntimeSeccompProfileEnabled: true
-    disableManifestsDirectory: true
-  network: {}
-  install:
-    disk: /dev/sda
-    image: ghcr.io/siderolabs/installer:latest
-    wipe: false
-  sysctls: {}
-  sysfs: {}
-  registries: {}
-  features:
-    rbac: true
-    stableHostname: true
-    apidCheckExtKeyUsage: true
-    diskQuotaSupport: true
-    kubePrism:
-      enabled: true
-      port: 7445
-    hostDNS:
-      enabled: true
-      forwardKubeDNSToHost: false
-      resolveMemberNames: true
-cluster:
-  id: %s
-  secret: %s
-  controlPlane:
-    endpoint: %s
-  clusterName: %s
-  network:
-    dnsDomain: cluster.local
-    podSubnets:
-      - 10.244.0.0/16
-    serviceSubnets:
-      - 10.96.0.0/12
-  token: %s
-  secretboxEncryptionSecret: ""
-  ca:
-    crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t
-    key: LS0tLS1CRUdJTiBFRDI1NTE5IFBSSVZBVEUgS0VZLS0tLS0=
-  aggregatorCA:
-    crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t
-    key: LS0tLS1CRUdJTiBFRDI1NTE5IFBSSVZBVEUgS0VZLS0tLS0=
-  serviceAccount:
-    key: LS0tLS1CRUdJTiBFRDI1NTE5IFBSSVZBVEUgS0VZLS0tLS0=
-  apiServer:
-    image: registry.k8s.io/kube-apiserver:v1.30.7
-    extraArgs: {}
-    extraVolumes: []
-    env: {}
-    certSANs: []
-    disablePodSecurityPolicy: true
-    admissionControl: []
-    auditPolicy: {}
-  controllerManager:
-    image: registry.k8s.io/kube-controller-manager:v1.30.7
-    extraArgs: {}
-    extraVolumes: []
-    env: {}
-  proxy:
-    disabled: false
-    image: registry.k8s.io/kube-proxy:v1.30.7
-    mode: ipvs
-    extraArgs: {}
-  scheduler:
-    image: registry.k8s.io/kube-scheduler:v1.30.7
-    extraArgs: {}
-    extraVolumes: []
-    env: {}
-  discovery:
-    enabled: true
-    registries:
-      kubernetes:
-        disabled: true
-      service:
-        disabled: false
-  etcd:
-    image: gcr.io/etcd-development/etcd:v3.5.13
-    ca:
-      crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t
-      key: LS0tLS1CRUdJTiBFRDI1NTE5IFBSSVZBVEUgS0VZLS0tLS0=
-    extraArgs: {}
-    advertisedSubnets: []
-  coreDNS:
-    image: registry.k8s.io/coredns/coredns:v1.11.1
-  externalCloudProvider:
-    enabled: false
-    manifests: []
-  adminKubeconfig:
-    certLifetime: 8760h0m0s
-  allowSchedulingOnMasters: true
-  inlineManifests: []
-  extraManifests: []
-  extraManifestHeaders: {}
-`,
-		"talos-cluster-123",   // cluster.id
-		"cluster-secret-456",  // cluster.secret
-		clusterEndpoint,       // cluster.controlPlane.endpoint
-		clusterName,           // cluster.clusterName
-		"bootstrap-token-789", // cluster.token
-	)
+	kubernetesVersion := constants.DefaultKubernetesVersion
+	if cr.Spec.ForProvider.KubernetesVersion != nil && *cr.Spec.ForProvider.KubernetesVersion != "" {
+		kubernetesVersion = *cr.Spec.ForProvider.KubernetesVersion
+	}
 
-	return machineConfig, nil
+	return clusterName, clusterEndpoint, kubernetesVersion
+}
+
+func (c *external) generationOptions(ctx context.Context, cr *machinev1alpha1.Configuration) ([]generate.Option, error) {
+	options := []generate.Option{}
+	if cr.Spec.ForProvider.TalosVersion != nil && *cr.Spec.ForProvider.TalosVersion != "" {
+		versionContract, err := talosconfig.ParseContractFromVersion(*cr.Spec.ForProvider.TalosVersion)
+		if err != nil {
+			return nil, err
+		}
+		options = append(options, generate.WithVersionContract(versionContract))
+	}
+
+	secretsBundle, err := c.getMachineSecretsBundle(ctx, cr)
+	if err != nil {
+		return nil, err
+	}
+	if secretsBundle != nil {
+		options = append(options, generate.WithSecretsBundle(secretsBundle))
+	}
+
+	return options, nil
+}
+
+func renderMachineConfig(config talosconfig.Provider, configPatches []string) (string, error) {
+	if len(configPatches) == 0 {
+		configBytes, err := config.Bytes()
+		return string(configBytes), err
+	}
+
+	patches, err := configpatcher.LoadPatches(configPatches)
+	if err != nil {
+		return "", err
+	}
+
+	patched, err := configpatcher.Apply(configpatcher.WithConfig(config), patches)
+	if err != nil {
+		return "", err
+	}
+
+	configBytes, err := patched.Bytes()
+	if err != nil {
+		return "", err
+	}
+
+	return string(configBytes), nil
+}
+
+func (c *external) getMachineSecretsBundle(ctx context.Context, cr *machinev1alpha1.Configuration) (*talossecrets.Bundle, error) {
+	if cr.Spec.ForProvider.MachineSecretsRef == nil {
+		return nil, errors.New("machineSecretsRef is required to generate deterministic machine configuration")
+	}
+	if c.kube == nil {
+		return nil, errors.New("cannot resolve machineSecretsRef without Kubernetes client")
+	}
+
+	secretsResource := &machinev1alpha1.Secrets{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Name: cr.Spec.ForProvider.MachineSecretsRef.Name}, secretsResource); err != nil {
+		return nil, errors.Wrap(err, "cannot get referenced machine secrets")
+	}
+
+	if secretsResource.Status.AtProvider.MachineSecrets == nil || secretsResource.Status.AtProvider.MachineSecrets.Bundle == "" {
+		return nil, errors.New("referenced machine secrets do not contain a generated bundle")
+	}
+
+	bundle := &talossecrets.Bundle{Clock: talossecrets.NewClock()}
+	if err := json.Unmarshal([]byte(secretsResource.Status.AtProvider.MachineSecrets.Bundle), bundle); err != nil {
+		return nil, errors.Wrap(err, "cannot decode referenced machine secrets bundle")
+	}
+	bundle.Clock = talossecrets.NewClock()
+
+	return bundle, nil
 }

@@ -47,6 +47,8 @@ type ClientConfiguration struct {
 
 // MachineSecretsData contains the generated machine secrets
 type MachineSecretsData struct {
+	// Bundle contains the full Talos machine secrets bundle in JSON format
+	Bundle string `json:"bundle,omitempty"`
 	// ClusterSecrets contains cluster-wide secrets in JSON format
 	ClusterSecrets string `json:"clusterSecrets,omitempty"`
 	// KubernetesSecrets contains Kubernetes-specific secrets in JSON format

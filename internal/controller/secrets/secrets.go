@@ -206,6 +206,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 		// Update the resource status with generated secrets
 		cr.Status.AtProvider.MachineSecrets = &v1alpha1.MachineSecretsData{
+			Bundle:            generatedSecrets.Bundle,
 			ClusterSecrets:    generatedSecrets.ClusterSecrets,
 			KubernetesSecrets: generatedSecrets.KubernetesSecrets,
 			TrustdInfo:        generatedSecrets.TrustdInfo,
@@ -227,6 +228,9 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		connectionDetails["ca_certificate"] = []byte(cr.Status.AtProvider.ClientConfiguration.CACertificate)
 		connectionDetails["client_certificate"] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientCertificate)
 		connectionDetails["client_key"] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientKey)
+	}
+	if cr.Status.AtProvider.MachineSecrets != nil && cr.Status.AtProvider.MachineSecrets.Bundle != "" {
+		connectionDetails["machine_secrets"] = []byte(cr.Status.AtProvider.MachineSecrets.Bundle)
 	}
 
 	// Set Ready condition
@@ -255,6 +259,7 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	// Update the resource status with generated secrets
 	cr.Status.AtProvider.MachineSecrets = &v1alpha1.MachineSecretsData{
+		Bundle:            generatedSecrets.Bundle,
 		ClusterSecrets:    generatedSecrets.ClusterSecrets,
 		KubernetesSecrets: generatedSecrets.KubernetesSecrets,
 		TrustdInfo:        generatedSecrets.TrustdInfo,
@@ -270,6 +275,7 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		"ca_certificate":     []byte(generatedSecrets.CACertificate),
 		"client_certificate": []byte(generatedSecrets.ClientCertificate),
 		"client_key":         []byte(generatedSecrets.ClientKey),
+		"machine_secrets":    []byte(generatedSecrets.Bundle),
 		"talos_config":       generatedSecrets.TalosConfig,
 	}
 
@@ -309,6 +315,7 @@ func (c *external) Disconnect(ctx context.Context) error {
 
 // GeneratedSecretsResult contains the generated Talos secrets
 type GeneratedSecretsResult struct {
+	Bundle            string
 	ClusterSecrets    string
 	KubernetesSecrets string
 	TrustdInfo        string
@@ -329,6 +336,11 @@ func (c *external) generateMachineSecrets(talosVersion *string) (*GeneratedSecre
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate secrets bundle")
 	}
+	bundleJSON, err := json.Marshal(secretsBundle)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to marshal secrets bundle")
+	}
+
 	clientCertificate, err := secretsBundle.GenerateTalosAPIClientCertificateWithTTL(role.MakeSet(role.Admin), constants.TalosAPIDefaultCertificateValidityDuration)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate Talos API client certificate")
@@ -386,6 +398,7 @@ func (c *external) generateMachineSecrets(talosVersion *string) (*GeneratedSecre
 	}
 
 	return &GeneratedSecretsResult{
+		Bundle:            string(bundleJSON),
 		ClusterSecrets:    string(clusterSecretsJSON),
 		KubernetesSecrets: string(kubernetesSecretsJSON),
 		TrustdInfo:        string(trustdInfoJSON),

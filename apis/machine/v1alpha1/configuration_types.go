@@ -36,8 +36,9 @@ type ConfigurationParameters struct {
 	MachineType string `json:"machineType"`
 	// ClusterEndpoint is the Kubernetes API endpoint (required)
 	ClusterEndpoint string `json:"clusterEndpoint"`
-	// MachineSecretsRef references the machine secrets
-	MachineSecretsRef *xpv1.Reference `json:"machineSecretsRef,omitempty"`
+	// MachineSecretsRef references the machine secrets used to generate deterministic configuration.
+	// +kubebuilder:validation:Required
+	MachineSecretsRef *xpv1.Reference `json:"machineSecretsRef"`
 	// TalosVersion is the Talos version (optional)
 	// +optional
 	TalosVersion *string `json:"talosVersion,omitempty"`
@@ -53,6 +54,8 @@ type ConfigurationParameters struct {
 type ConfigurationObservation struct {
 	// MachineConfiguration is the generated Talos configuration
 	MachineConfiguration string `json:"machineConfiguration,omitempty"`
+	// MachineConfigurationHash is the SHA-256 hash of the generated Talos configuration
+	MachineConfigurationHash string `json:"machineConfigurationHash,omitempty"`
 	// GeneratedTime is when the configuration was generated
 	GeneratedTime *metav1.Time `json:"generatedTime,omitempty"`
 }
