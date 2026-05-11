@@ -8,6 +8,8 @@ spec:
     clusterName: demo-cluster
     machineType: worker
     clusterEndpoint: https://192.168.120.87:6443
+    machineSecretsRef:
+      name: cluster-secrets
     talosVersion: v1.8.0
   providerConfigRef:
     name: default
