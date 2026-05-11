@@ -90,6 +90,7 @@ spec:
                     type: string
                   machineSecretsRef:
                     description: MachineSecretsRef references the machine secrets
+                      used to generate deterministic configuration.
                     properties:
                       name:
                         description: Name of the referenced object.
@@ -139,6 +140,7 @@ spec:
                 required:
                 - clusterEndpoint
                 - clusterName
+                - machineSecretsRef
                 - machineType
                 - node
                 type: object
@@ -323,6 +325,10 @@ spec:
                     type: string
                   machineConfiguration:
                     description: MachineConfiguration is the generated Talos configuration
+                    type: string
+                  machineConfigurationHash:
+                    description: MachineConfigurationHash is the SHA-256 hash of the
+                      generated Talos configuration
                     type: string
                 type: object
               conditions:
