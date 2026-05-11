@@ -12,8 +12,8 @@ This example demonstrates the complete workflow for setting up a Talos machine u
 
 This example creates three resources in sequence:
 
-1. **Secrets** - Generates cluster secrets locally
-2. **Configuration** - Generates machine configuration using the secrets
+1. **Secrets** - Generates cluster secrets locally and writes them to a connection secret
+2. **Configuration** - Generates machine configuration using `machineSecretsRef`
 3. **ConfigurationApply** - Applies the configuration to a real Talos machine
 
 ## Workflow
@@ -62,10 +62,14 @@ For a controlplane node:
 kubectl apply -f configurationapply-controlplane.yaml
 ```
 
-For a node that already has certificates (configured mode), copy one of the manifests above and replace the `clientConfiguration` `caCertificate`, `clientCertificate`, and `clientKey` values with the ones produced by the Secrets resource:
+For a node that already has certificates (configured mode), copy one of the manifests above and replace the `clientConfiguration` `caCertificate`, `clientCertificate`, and `clientKey` values with the raw PEM connection details produced by the `Secrets` resource:
 ```bash
-kubectl get secrets.machine.talos.crossplane.io cluster-secrets -o yaml
+kubectl get secret cluster-talos-secrets -o jsonpath='{.data.ca_certificate}' | base64 -d
+kubectl get secret cluster-talos-secrets -o jsonpath='{.data.client_certificate}' | base64 -d
+kubectl get secret cluster-talos-secrets -o jsonpath='{.data.client_key}' | base64 -d
 ```
+
+The `machine_secrets` connection detail is the canonical structured JSON contract for compositions. The `machine_secrets_bundle` key is retained only for compatibility with consumers that need the native Talos SDK bundle JSON.
 
 ## Verification
 
