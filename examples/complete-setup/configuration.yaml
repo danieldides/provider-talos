@@ -1,6 +1,25 @@
 apiVersion: machine.talos.crossplane.io/v1alpha1
 kind: Configuration
 metadata:
+  name: controlplane-config
+spec:
+  forProvider:
+    node: "192.168.120.87"
+    clusterName: demo-cluster
+    machineType: controlplane
+    clusterEndpoint: https://192.168.120.87:6443
+    machineSecretsRef:
+      name: cluster-secrets
+    talosVersion: v1.8.0
+  providerConfigRef:
+    name: default
+  writeConnectionSecretToRef:
+    name: controlplane-machine-configuration
+    namespace: default
+---
+apiVersion: machine.talos.crossplane.io/v1alpha1
+kind: Configuration
+metadata:
   name: worker-config
 spec:
   forProvider:
