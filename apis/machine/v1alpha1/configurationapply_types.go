@@ -26,6 +26,7 @@ import (
 )
 
 // ConfigurationApplyParameters are the configurable fields of a ConfigurationApply.
+// +kubebuilder:validation:XValidation:rule="has(self.machineConfigurationRef) || has(self.machineConfiguration)",message="machineConfigurationRef or machineConfiguration must be set"
 type ConfigurationApplyParameters struct {
 	// Node is the target machine identifier (required)
 	Node string `json:"node"`
@@ -37,7 +38,11 @@ type ConfigurationApplyParameters struct {
 	// +kubebuilder:validation:Enum=auto;reboot;no_reboot;staged
 	ApplyMode *string `json:"applyMode,omitempty"`
 	// MachineConfiguration defines the Talos machine configuration to apply
-	MachineConfiguration MachineConfigurationSpec `json:"machineConfiguration"`
+	// +optional
+	MachineConfiguration *MachineConfigurationSpec `json:"machineConfiguration,omitempty"`
+	// MachineConfigurationRef references raw Talos machine configuration bytes in a Secret.
+	// +optional
+	MachineConfigurationRef *SecretKeyReference `json:"machineConfigurationRef,omitempty"`
 	// ConfigPatches is a list of configuration modifications (optional)
 	// +optional
 	ConfigPatches []string `json:"configPatches,omitempty"`
@@ -46,6 +51,16 @@ type ConfigurationApplyParameters struct {
 	OnDestroy *string `json:"onDestroy,omitempty"`
 	// ClientConfiguration for authentication
 	ClientConfiguration ClientConfiguration `json:"clientConfiguration"`
+}
+
+// SecretKeyReference identifies a key in a Kubernetes Secret.
+type SecretKeyReference struct {
+	// Name is the name of the Secret.
+	Name string `json:"name"`
+	// Namespace is the namespace of the Secret.
+	Namespace string `json:"namespace"`
+	// Key is the data key containing the value.
+	Key string `json:"key"`
 }
 
 // ConfigurationApplyObservation are the observable fields of a ConfigurationApply.

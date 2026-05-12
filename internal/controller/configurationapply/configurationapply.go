@@ -31,6 +31,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -155,6 +156,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}
 
 	return &external{
+		kube:               c.kube,
 		service:            svc,
 		providerConfigData: data,
 	}, nil
@@ -163,6 +165,8 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 // An ExternalClient observes, then either creates, updates, or deletes an
 // external resource to ensure it reflects the managed resource's desired state.
 type external struct {
+	// kube reads referenced Kubernetes resources such as connection Secrets.
+	kube ctrlclient.Client
 	// A 'client' used to connect to the external resource API. In practice this
 	// would be something like an AWS SDK client.
 	service interface{}
@@ -208,7 +212,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	case MachineStateUnreachable:
 		if applied {
-			cr.SetConditions(xpv1.Available())
+			cr.SetConditions(xpv1.Unavailable())
 			fmt.Printf("Machine %s unreachable but configuration was applied - likely installing\n", cr.Spec.ForProvider.Node)
 		} else {
 			fmt.Printf("Machine %s unreachable and configuration not applied\n", cr.Spec.ForProvider.Node)
@@ -238,10 +242,16 @@ func resolveAppliedStatus(cr *v1alpha1.ConfigurationApply) bool {
 }
 
 func hasValidMachineConfig(cr *v1alpha1.ConfigurationApply) bool {
-	return cr.Spec.ForProvider.MachineConfiguration.Version != "" &&
-		cr.Spec.ForProvider.MachineConfiguration.Machine.Type != "" &&
-		cr.Spec.ForProvider.MachineConfiguration.Machine.Token != "" &&
-		cr.Spec.ForProvider.MachineConfiguration.Cluster.ID != ""
+	if ref := cr.Spec.ForProvider.MachineConfigurationRef; ref != nil {
+		return ref.Name != "" && ref.Namespace != "" && ref.Key != ""
+	}
+
+	config := cr.Spec.ForProvider.MachineConfiguration
+	return config != nil &&
+		config.Version != "" &&
+		config.Machine.Type != "" &&
+		config.Machine.Token != "" &&
+		config.Cluster.ID != ""
 }
 
 func observationState(machineState MachineState, applied, hasValidConfig bool) (bool, bool) {
@@ -440,13 +450,12 @@ func (c *external) canConnectWithCreds(ctx context.Context, cr *v1alpha1.Configu
 
 // applyConfigurationToNode applies a Talos configuration to the specified node
 func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.ConfigurationApply) error {
-	// Generate machine configuration from structured fields
-	configInput, err := c.generateMachineConfigurationYAML(cr.Spec.ForProvider.MachineConfiguration)
+	configInput, err := c.resolveMachineConfiguration(ctx, cr)
 	if err != nil {
-		return errors.Wrap(err, "failed to generate machine configuration YAML")
+		return err
 	}
 
-	fmt.Printf("Generated configuration YAML (length: %d bytes)\n", len(configInput))
+	fmt.Printf("Resolved configuration YAML (length: %d bytes)\n", len(configInput))
 
 	// For now, skip config parsing validation
 	// In a complete implementation, this would validate the configuration
@@ -481,7 +490,7 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 	}
 
 	_, err = talosClient.ApplyConfiguration(ctx, &machine.ApplyConfigurationRequest{
-		Data: []byte(configInput),
+		Data: configInput,
 		Mode: mode,
 	})
 	if err != nil {
@@ -490,6 +499,56 @@ func (c *external) applyConfigurationToNode(ctx context.Context, cr *v1alpha1.Co
 
 	fmt.Printf("Successfully applied configuration to node %s\n", cr.Spec.ForProvider.Node)
 	return nil
+}
+
+func (c *external) resolveMachineConfiguration(ctx context.Context, cr *v1alpha1.ConfigurationApply) ([]byte, error) {
+	if ref := cr.Spec.ForProvider.MachineConfigurationRef; ref != nil {
+		return c.resolveMachineConfigurationRef(ctx, ref)
+	}
+
+	if cr.Spec.ForProvider.MachineConfiguration == nil {
+		return nil, errors.New("spec.forProvider.machineConfigurationRef or spec.forProvider.machineConfiguration must be set")
+	}
+
+	configInput, err := c.generateMachineConfigurationYAML(*cr.Spec.ForProvider.MachineConfiguration)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to generate machine configuration YAML")
+	}
+	if len(configInput) == 0 {
+		return nil, errors.New("generated machine configuration is empty")
+	}
+
+	return []byte(configInput), nil
+}
+
+func (c *external) resolveMachineConfigurationRef(ctx context.Context, ref *v1alpha1.SecretKeyReference) ([]byte, error) {
+	if c.kube == nil {
+		return nil, errors.New("cannot resolve machineConfigurationRef without Kubernetes client")
+	}
+	if ref.Name == "" {
+		return nil, errors.New("spec.forProvider.machineConfigurationRef.name must be set")
+	}
+	if ref.Namespace == "" {
+		return nil, errors.New("spec.forProvider.machineConfigurationRef.namespace must be set")
+	}
+	if ref.Key == "" {
+		return nil, errors.New("spec.forProvider.machineConfigurationRef.key must be set")
+	}
+
+	secret := &corev1.Secret{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}, secret); err != nil {
+		return nil, errors.Wrapf(err, "cannot get machineConfigurationRef secret %s/%s", ref.Namespace, ref.Name)
+	}
+
+	data, ok := secret.Data[ref.Key]
+	if !ok {
+		return nil, errors.Errorf("machineConfigurationRef secret %s/%s is missing key %q", ref.Namespace, ref.Name, ref.Key)
+	}
+	if len(data) == 0 {
+		return nil, errors.Errorf("machineConfigurationRef secret %s/%s key %q is empty", ref.Namespace, ref.Name, ref.Key)
+	}
+
+	return data, nil
 }
 
 func (c *external) buildApplyTLSConfig(ctx context.Context, cr *v1alpha1.ConfigurationApply) (*tls.Config, bool, error) {

@@ -45,10 +45,76 @@ type ClientConfiguration struct {
 	ClientKey string `json:"clientKey"`
 }
 
+// MachineSecrets contains the complete structured Talos machine secrets contract.
+type MachineSecrets struct {
+	// Cluster contains cluster-wide secrets.
+	Cluster MachineSecretsCluster `json:"cluster"`
+	// Secrets contains encryption and bootstrap secrets.
+	Secrets MachineSecretsSecrets `json:"secrets"`
+	// TrustdInfo contains trustd credentials.
+	TrustdInfo MachineSecretsTrustdInfo `json:"trustdinfo"`
+	// Certs contains Talos and Kubernetes CA material.
+	Certs MachineSecretsCerts `json:"certs"`
+}
+
+// MachineSecretsCluster contains cluster-wide secrets.
+type MachineSecretsCluster struct {
+	// ID is the Talos cluster ID.
+	ID string `json:"id"`
+	// Secret is the Talos cluster secret.
+	Secret string `json:"secret"`
+}
+
+// MachineSecretsSecrets contains encryption and bootstrap secrets.
+type MachineSecretsSecrets struct {
+	// BootstrapToken is the bootstrap token.
+	BootstrapToken string `json:"bootstrap_token"`
+	// SecretboxEncryptionSecret is the secretbox encryption secret.
+	SecretboxEncryptionSecret string `json:"secretbox_encryption_secret,omitempty"`
+	// AESCBCEncryptionSecret is the AES-CBC encryption secret.
+	AESCBCEncryptionSecret string `json:"aescbc_encryption_secret,omitempty"`
+}
+
+// MachineSecretsTrustdInfo contains trustd credentials.
+type MachineSecretsTrustdInfo struct {
+	// Token is the trustd token.
+	Token string `json:"token"`
+}
+
+// MachineSecretsCerts contains Talos and Kubernetes CA material.
+type MachineSecretsCerts struct {
+	// Etcd contains etcd CA certificate and key.
+	Etcd MachineSecretsCertificateAndKey `json:"etcd"`
+	// K8s contains Kubernetes CA certificate and key.
+	K8s MachineSecretsCertificateAndKey `json:"k8s"`
+	// K8sAggregator contains Kubernetes aggregator CA certificate and key.
+	K8sAggregator MachineSecretsCertificateAndKey `json:"k8s_aggregator"`
+	// K8sServiceAccount contains Kubernetes service account key.
+	K8sServiceAccount MachineSecretsKey `json:"k8s_serviceaccount"`
+	// OS contains Talos API CA certificate and key.
+	OS MachineSecretsCertificateAndKey `json:"os"`
+}
+
+// MachineSecretsCertificateAndKey contains a base64-encoded PEM certificate and key.
+type MachineSecretsCertificateAndKey struct {
+	// Cert is a base64-encoded PEM certificate.
+	Cert string `json:"cert"`
+	// Key is a base64-encoded PEM private key.
+	Key string `json:"key"`
+}
+
+// MachineSecretsKey contains a base64-encoded PEM key.
+type MachineSecretsKey struct {
+	// Key is a base64-encoded PEM private key.
+	Key string `json:"key"`
+}
+
 // MachineSecretsData contains the generated machine secrets
 type MachineSecretsData struct {
 	// Bundle contains the full Talos machine secrets bundle in JSON format
 	Bundle string `json:"bundle,omitempty"`
+	// Structured contains the complete machine secrets contract. Values are base64-encoded PEM strings.
+	Structured *MachineSecrets `json:"structured,omitempty"`
 	// ClusterSecrets contains cluster-wide secrets in JSON format
 	ClusterSecrets string `json:"clusterSecrets,omitempty"`
 	// KubernetesSecrets contains Kubernetes-specific secrets in JSON format

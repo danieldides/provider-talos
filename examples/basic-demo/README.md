@@ -20,7 +20,9 @@ watch kubectl get secrets.machine.talos.crossplane.io,configurations.machine.tal
 
 Both resources should show `SYNCED=True`:
 - **Secrets**: Generates Talos machine secrets
-- **Configuration**: Generates Talos machine configuration  
+- **Configuration**: Generates Talos machine configuration from `machineSecretsRef`
+
+`Secrets` writes a connection secret named `demo-talos-secrets` with structured `machine_secrets`, compatibility `machine_secrets_bundle`, and Talos API client configuration details.
 
 ## Clean Up
 

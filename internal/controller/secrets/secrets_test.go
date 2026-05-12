@@ -17,17 +17,24 @@ limitations under the License.
 package secrets
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	talossecrets "github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/pkg/test"
+
+	machinev1alpha1 "github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 )
 
 // Unlike many Kubernetes projects Crossplane does not use third party testing
@@ -76,17 +83,119 @@ func TestObserve(t *testing.T) {
 	}
 }
 
+func TestSecretsBundleToMachineSecrets(t *testing.T) {
+	t.Parallel()
+
+	bundle, err := talossecrets.NewBundle(talossecrets.NewClock(), nil)
+	if err != nil {
+		t.Fatalf("talossecrets.NewBundle(...): %v", err)
+	}
+
+	machineSecrets, err := SecretsBundleToMachineSecrets(bundle)
+	if err != nil {
+		t.Fatalf("SecretsBundleToMachineSecrets(...): %v", err)
+	}
+
+	if machineSecrets.Cluster.ID != bundle.Cluster.ID {
+		t.Fatalf("expected cluster ID %q, got %q", bundle.Cluster.ID, machineSecrets.Cluster.ID)
+	}
+	if machineSecrets.Secrets.BootstrapToken != bundle.Secrets.BootstrapToken {
+		t.Fatalf("expected bootstrap token %q, got %q", bundle.Secrets.BootstrapToken, machineSecrets.Secrets.BootstrapToken)
+	}
+	if machineSecrets.TrustdInfo.Token != bundle.TrustdInfo.Token {
+		t.Fatalf("expected trustd token %q, got %q", bundle.TrustdInfo.Token, machineSecrets.TrustdInfo.Token)
+	}
+
+	for name, value := range map[string]string{
+		"certs.etcd.cert":              machineSecrets.Certs.Etcd.Cert,
+		"certs.etcd.key":               machineSecrets.Certs.Etcd.Key,
+		"certs.k8s.cert":               machineSecrets.Certs.K8s.Cert,
+		"certs.k8s.key":                machineSecrets.Certs.K8s.Key,
+		"certs.k8s_aggregator.cert":    machineSecrets.Certs.K8sAggregator.Cert,
+		"certs.k8s_aggregator.key":     machineSecrets.Certs.K8sAggregator.Key,
+		"certs.k8s_serviceaccount.key": machineSecrets.Certs.K8sServiceAccount.Key,
+		"certs.os.cert":                machineSecrets.Certs.OS.Cert,
+		"certs.os.key":                 machineSecrets.Certs.OS.Key,
+	} {
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			t.Fatalf("expected %s to be base64 encoded: %v", name, err)
+		}
+		if block, _ := pem.Decode(decoded); block == nil {
+			t.Fatalf("expected %s to decode to PEM", name)
+		}
+	}
+}
+
+func TestMachineSecretsToSecretsBundle(t *testing.T) {
+	t.Parallel()
+
+	bundle, err := talossecrets.NewBundle(talossecrets.NewClock(), nil)
+	if err != nil {
+		t.Fatalf("talossecrets.NewBundle(...): %v", err)
+	}
+	machineSecrets, err := SecretsBundleToMachineSecrets(bundle)
+	if err != nil {
+		t.Fatalf("SecretsBundleToMachineSecrets(...): %v", err)
+	}
+
+	got, err := MachineSecretsToSecretsBundle(machineSecrets)
+	if err != nil {
+		t.Fatalf("MachineSecretsToSecretsBundle(...): %v", err)
+	}
+
+	if got.Cluster.ID != bundle.Cluster.ID || got.Cluster.Secret != bundle.Cluster.Secret {
+		t.Fatal("expected cluster fields to round trip")
+	}
+	if !bytes.Equal(got.Certs.OS.Crt, bundle.Certs.OS.Crt) || !bytes.Equal(got.Certs.OS.Key, bundle.Certs.OS.Key) {
+		t.Fatal("expected OS CA to round trip")
+	}
+}
+
+func TestGenerateClientConfiguration(t *testing.T) {
+	t.Parallel()
+
+	bundle, err := talossecrets.NewBundle(talossecrets.NewClock(), nil)
+	if err != nil {
+		t.Fatalf("talossecrets.NewBundle(...): %v", err)
+	}
+
+	clientConfiguration, err := GenerateClientConfiguration(bundle, time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateClientConfiguration(...): %v", err)
+	}
+
+	if clientConfiguration.ClientCertificate == string(bundle.Certs.OS.Crt) {
+		t.Fatal("expected client certificate to differ from OS CA certificate")
+	}
+	if _, err := tls.X509KeyPair([]byte(clientConfiguration.ClientCertificate), []byte(clientConfiguration.ClientKey)); err != nil {
+		t.Fatalf("expected client certificate and key to match: %v", err)
+	}
+
+	ca := parseCertificate(t, []byte(clientConfiguration.CACertificate))
+	client := parseCertificate(t, []byte(clientConfiguration.ClientCertificate))
+	if err := client.CheckSignatureFrom(ca); err != nil {
+		t.Fatalf("expected client certificate to be signed by OS CA: %v", err)
+	}
+}
+
 func TestGenerateMachineSecretsUsesAdminClientCertificate(t *testing.T) {
+	t.Parallel()
+
 	generated, err := (&external{}).generateMachineSecrets(nil)
 	if err != nil {
 		t.Fatalf("generateMachineSecrets(...): unexpected error: %v", err)
 	}
 
-	if generated.ClientCertificate == generated.CACertificate {
+	clientConfiguration := generated.ClientConfiguration
+	if clientConfiguration == nil {
+		t.Fatal("expected client configuration")
+	}
+	if clientConfiguration.ClientCertificate == clientConfiguration.CACertificate {
 		t.Fatal("ClientCertificate matches CACertificate, want generated leaf certificate")
 	}
 
-	clientCert := parseCertificate(t, generated.ClientCertificate)
+	clientCert := parseCertificate(t, []byte(clientConfiguration.ClientCertificate))
 	if clientCert.IsCA {
 		t.Fatal("ClientCertificate IsCA = true, want false")
 	}
@@ -97,11 +206,20 @@ func TestGenerateMachineSecretsUsesAdminClientCertificate(t *testing.T) {
 		t.Fatal("ClientCertificate missing ExtKeyUsageClientAuth")
 	}
 
-	caCert := parseCertificate(t, generated.CACertificate)
+	caCert := parseCertificate(t, []byte(clientConfiguration.CACertificate))
 	roots := x509.NewCertPool()
 	roots.AddCert(caCert)
 	if _, err := clientCert.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
 		t.Fatalf("ClientCertificate did not verify against CACertificate: %v", err)
+	}
+
+	cr := &machinev1alpha1.Secrets{Status: machinev1alpha1.SecretsStatus{AtProvider: machinev1alpha1.SecretsObservation{
+		MachineSecrets:      &machinev1alpha1.MachineSecretsData{Bundle: generated.Bundle, Structured: generated.MachineSecrets},
+		ClientConfiguration: clientConfiguration,
+	}}}
+	details, err := connectionDetailsFromStatus(cr)
+	if err != nil {
+		t.Fatalf("connectionDetailsFromStatus(...): %v", err)
 	}
 
 	var talosConfig struct {
@@ -111,34 +229,92 @@ func TestGenerateMachineSecretsUsesAdminClientCertificate(t *testing.T) {
 			Key string `json:"key"`
 		} `json:"contexts"`
 	}
-	if err := json.Unmarshal(generated.TalosConfig, &talosConfig); err != nil {
+	if err := json.Unmarshal(details[connectionKeyTalosConfig], &talosConfig); err != nil {
 		t.Fatalf("TalosConfig JSON unmarshal failed: %v", err)
 	}
 	ctx, ok := talosConfig.Contexts["default"]
 	if !ok {
 		t.Fatal("TalosConfig missing default context")
 	}
-	if diff := cmp.Diff(generated.CACertificate, ctx.CA); diff != "" {
+	if diff := cmp.Diff(clientConfiguration.CACertificate, ctx.CA); diff != "" {
 		t.Errorf("TalosConfig CA: -want, +got:\n%s", diff)
 	}
-	if diff := cmp.Diff(generated.ClientCertificate, ctx.Crt); diff != "" {
+	if diff := cmp.Diff(clientConfiguration.ClientCertificate, ctx.Crt); diff != "" {
 		t.Errorf("TalosConfig client certificate: -want, +got:\n%s", diff)
 	}
-	if diff := cmp.Diff(generated.ClientKey, ctx.Key); diff != "" {
+	if diff := cmp.Diff(clientConfiguration.ClientKey, ctx.Key); diff != "" {
 		t.Errorf("TalosConfig client key: -want, +got:\n%s", diff)
 	}
 }
 
-func parseCertificate(t *testing.T, certPEM string) *x509.Certificate {
+func TestConnectionDetailsFromStatus(t *testing.T) {
+	t.Parallel()
+
+	bundle, err := talossecrets.NewBundle(talossecrets.NewClock(), nil)
+	if err != nil {
+		t.Fatalf("talossecrets.NewBundle(...): %v", err)
+	}
+	machineSecrets, err := SecretsBundleToMachineSecrets(bundle)
+	if err != nil {
+		t.Fatalf("SecretsBundleToMachineSecrets(...): %v", err)
+	}
+	clientConfiguration, err := GenerateClientConfiguration(bundle, time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateClientConfiguration(...): %v", err)
+	}
+	bundleJSON, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatalf("json.Marshal(...): %v", err)
+	}
+
+	cr := &machinev1alpha1.Secrets{Status: machinev1alpha1.SecretsStatus{AtProvider: machinev1alpha1.SecretsObservation{
+		MachineSecrets:      &machinev1alpha1.MachineSecretsData{Bundle: string(bundleJSON), Structured: machineSecrets},
+		ClientConfiguration: clientConfiguration,
+	}}}
+
+	details, err := connectionDetailsFromStatus(cr)
+	if err != nil {
+		t.Fatalf("connectionDetailsFromStatus(...): %v", err)
+	}
+
+	if bytes.Equal(details[connectionKeyMachineSecrets], bundleJSON) {
+		t.Fatal("expected machine_secrets to contain structured JSON, not raw bundle JSON")
+	}
+	if !bytes.Equal(details[connectionKeyMachineSecretsBundle], bundleJSON) {
+		t.Fatal("expected machine_secrets_bundle to contain raw bundle JSON")
+	}
+	if string(details[connectionKeyClientCertificate]) != clientConfiguration.ClientCertificate {
+		t.Fatal("expected top-level client_certificate to remain raw PEM")
+	}
+	if !json.Valid(details[connectionKeyTalosConfig]) {
+		t.Fatal("expected talos_config to contain JSON")
+	}
+
+	var connectionClientConfiguration machinev1alpha1.ClientConfiguration
+	if err := json.Unmarshal(details[connectionKeyClientConfiguration], &connectionClientConfiguration); err != nil {
+		t.Fatalf("json.Unmarshal(...): %v", err)
+	}
+	decodedClientCertificate, err := base64.StdEncoding.DecodeString(connectionClientConfiguration.ClientCertificate)
+	if err != nil {
+		t.Fatalf("expected client_configuration.clientCertificate to be base64: %v", err)
+	}
+	if string(decodedClientCertificate) != clientConfiguration.ClientCertificate {
+		t.Fatal("expected client_configuration.clientCertificate to decode to raw PEM")
+	}
+}
+
+func parseCertificate(t *testing.T, pemBytes []byte) *x509.Certificate {
 	t.Helper()
-	block, _ := pem.Decode([]byte(certPEM))
+
+	block, _ := pem.Decode(pemBytes)
 	if block == nil {
-		t.Fatal("failed to decode certificate PEM")
+		t.Fatal("expected PEM certificate")
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		t.Fatalf("failed to parse certificate: %v", err)
+		t.Fatalf("x509.ParseCertificate(...): %v", err)
 	}
+
 	return cert
 }
 

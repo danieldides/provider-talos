@@ -5,8 +5,10 @@ metadata:
 spec:
   forProvider:
     node: "192.168.1.101"
-    configurationRef:
-      name: example-worker-config
+    machineConfigurationRef:
+      name: talos-worker-config
+      namespace: default
+      key: machine_configuration
     clientConfiguration:
       # These should reference actual certificates from secrets
       caCertificate: "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t..."

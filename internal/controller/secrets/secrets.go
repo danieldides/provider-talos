@@ -18,12 +18,17 @@ package secrets
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
+	"time"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
 	"github.com/pkg/errors"
+	siderox509 "github.com/siderolabs/crypto/x509"
+	talosconfig "github.com/siderolabs/talos/pkg/machinery/config"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/role"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,9 +46,7 @@ import (
 	apisv1alpha1 "github.com/crossplane-contrib/provider-talos/apis/v1alpha1"
 	"github.com/crossplane-contrib/provider-talos/internal/features"
 
-	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
-	"github.com/siderolabs/talos/pkg/machinery/constants"
-	"github.com/siderolabs/talos/pkg/machinery/role"
+	talossecrets "github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 )
 
 const (
@@ -53,6 +56,14 @@ const (
 	errGetCreds     = "cannot get credentials"
 
 	errNewClient = "cannot create new Service"
+
+	connectionKeyMachineSecrets       = "machine_secrets"
+	connectionKeyMachineSecretsBundle = "machine_secrets_bundle"
+	connectionKeyClientConfiguration  = "client_configuration"
+	connectionKeyCACertificate        = "ca_certificate"
+	connectionKeyClientCertificate    = "client_certificate"
+	connectionKeyClientKey            = "client_key"
+	connectionKeyTalosConfig          = "talos_config"
 )
 
 // TalosSecretsService manages Talos machine secrets
@@ -62,8 +73,8 @@ type TalosSecretsService struct {
 
 // GenerateSecrets generates new Talos machine secrets
 type GeneratedSecrets struct {
-	Cluster     *secrets.Cluster
-	Secrets     *secrets.Bundle
+	Cluster     *talossecrets.Cluster
+	Secrets     *talossecrets.Bundle
 	TalosConfig []byte
 }
 
@@ -188,46 +199,22 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.New(errNotSecrets)
 	}
 
-	// Debug logging
-	fmt.Printf("Observing Secrets: %s\n", cr.Name)
-	fmt.Printf("  MachineSecrets nil: %v\n", cr.Status.AtProvider.MachineSecrets == nil)
-	fmt.Printf("  ClientConfiguration nil: %v\n", cr.Status.AtProvider.ClientConfiguration == nil)
-
 	// Check if secrets already exist in status (locally generated)
 	statusExists := cr.Status.AtProvider.MachineSecrets != nil && cr.Status.AtProvider.ClientConfiguration != nil
 
 	// If secrets don't exist yet, generate them now
 	if !statusExists {
-		fmt.Printf("Generating secrets for: %s\n", cr.Name)
 		generatedSecrets, err := c.generateMachineSecrets(cr.Spec.ForProvider.TalosVersion)
 		if err != nil {
 			return managed.ExternalObservation{}, errors.Wrap(err, "failed to generate machine secrets")
 		}
-
-		// Update the resource status with generated secrets
-		cr.Status.AtProvider.MachineSecrets = &v1alpha1.MachineSecretsData{
-			Bundle:            generatedSecrets.Bundle,
-			ClusterSecrets:    generatedSecrets.ClusterSecrets,
-			KubernetesSecrets: generatedSecrets.KubernetesSecrets,
-			TrustdInfo:        generatedSecrets.TrustdInfo,
-		}
-
-		cr.Status.AtProvider.ClientConfiguration = &v1alpha1.ClientConfiguration{
-			CACertificate:     generatedSecrets.CACertificate,
-			ClientCertificate: generatedSecrets.ClientCertificate,
-			ClientKey:         generatedSecrets.ClientKey,
-		}
-
-		fmt.Printf("Successfully generated secrets (length: %d bytes)\n", len(generatedSecrets.ClusterSecrets))
+		populateStatus(cr, generatedSecrets)
 	}
 
 	// Secrets are local resources - always exist after generation
-	connectionDetails := managed.ConnectionDetails{}
-	if cr.Status.AtProvider.ClientConfiguration != nil {
-		// Store client configuration as connection details
-		connectionDetails["ca_certificate"] = []byte(cr.Status.AtProvider.ClientConfiguration.CACertificate)
-		connectionDetails["client_certificate"] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientCertificate)
-		connectionDetails["client_key"] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientKey)
+	connectionDetails, err := connectionDetailsFromStatus(cr)
+	if err != nil {
+		return managed.ExternalObservation{}, err
 	}
 	if cr.Status.AtProvider.MachineSecrets != nil && cr.Status.AtProvider.MachineSecrets.Bundle != "" {
 		connectionDetails["machine_secrets"] = []byte(cr.Status.AtProvider.MachineSecrets.Bundle)
@@ -249,34 +236,15 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalCreation{}, errors.New(errNotSecrets)
 	}
 
-	fmt.Printf("Creating Secrets: %s\n", cr.Name)
-
 	// Generate new machine secrets using Talos SDK
 	generatedSecrets, err := c.generateMachineSecrets(cr.Spec.ForProvider.TalosVersion)
 	if err != nil {
 		return managed.ExternalCreation{}, errors.Wrap(err, "failed to generate machine secrets")
 	}
-
-	// Update the resource status with generated secrets
-	cr.Status.AtProvider.MachineSecrets = &v1alpha1.MachineSecretsData{
-		Bundle:            generatedSecrets.Bundle,
-		ClusterSecrets:    generatedSecrets.ClusterSecrets,
-		KubernetesSecrets: generatedSecrets.KubernetesSecrets,
-		TrustdInfo:        generatedSecrets.TrustdInfo,
-	}
-	cr.Status.AtProvider.ClientConfiguration = &v1alpha1.ClientConfiguration{
-		CACertificate:     generatedSecrets.CACertificate,
-		ClientCertificate: generatedSecrets.ClientCertificate,
-		ClientKey:         generatedSecrets.ClientKey,
-	}
-
-	// Return connection details for the secret
-	connectionDetails := managed.ConnectionDetails{
-		"ca_certificate":     []byte(generatedSecrets.CACertificate),
-		"client_certificate": []byte(generatedSecrets.ClientCertificate),
-		"client_key":         []byte(generatedSecrets.ClientKey),
-		"machine_secrets":    []byte(generatedSecrets.Bundle),
-		"talos_config":       generatedSecrets.TalosConfig,
+	populateStatus(cr, generatedSecrets)
+	connectionDetails, err := connectionDetailsFromStatus(cr)
+	if err != nil {
+		return managed.ExternalCreation{}, err
 	}
 
 	return managed.ExternalCreation{
@@ -315,24 +283,24 @@ func (c *external) Disconnect(ctx context.Context) error {
 
 // GeneratedSecretsResult contains the generated Talos secrets
 type GeneratedSecretsResult struct {
-	Bundle            string
-	ClusterSecrets    string
-	KubernetesSecrets string
-	TrustdInfo        string
-	CACertificate     string
-	ClientCertificate string
-	ClientKey         string
-	TalosConfig       []byte
+	Bundle              string
+	MachineSecrets      *v1alpha1.MachineSecrets
+	ClusterSecrets      string
+	KubernetesSecrets   string
+	TrustdInfo          string
+	ClientConfiguration *v1alpha1.ClientConfiguration
 }
 
 // generateMachineSecrets generates new Talos machine secrets using the Talos SDK
 func (c *external) generateMachineSecrets(talosVersion *string) (*GeneratedSecretsResult, error) {
-	// TODO: Use talosVersion parameter to generate version-specific secrets
-	_ = talosVersion // suppress unused parameter warning until implementation
+	versionContract, err := parseVersionContract(talosVersion)
+	if err != nil {
+		return nil, err
+	}
 
 	// Generate machine secrets bundle using current time
-	clock := secrets.NewClock()
-	secretsBundle, err := secrets.NewBundle(clock, nil)
+	clock := talossecrets.NewClock()
+	secretsBundle, err := talossecrets.NewBundle(clock, versionContract)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate secrets bundle")
 	}
@@ -340,71 +308,307 @@ func (c *external) generateMachineSecrets(talosVersion *string) (*GeneratedSecre
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to marshal secrets bundle")
 	}
+	machineSecrets, err := SecretsBundleToMachineSecrets(secretsBundle)
+	if err != nil {
+		return nil, err
+	}
 
-	clientCertificate, err := secretsBundle.GenerateTalosAPIClientCertificateWithTTL(role.MakeSet(role.Admin), constants.TalosAPIDefaultCertificateValidityDuration)
+	clientConfiguration, err := GenerateClientConfiguration(secretsBundle, constants.TalosAPIDefaultCertificateValidityDuration)
+	if err != nil {
+		return nil, err
+	}
+
+	clusterSecretsJSON, err := marshalClusterSecrets(secretsBundle)
+	if err != nil {
+		return nil, err
+	}
+
+	kubernetesSecretsJSON, err := marshalKubernetesSecrets(secretsBundle)
+	if err != nil {
+		return nil, err
+	}
+
+	trustdInfoJSON, err := marshalTrustdInfo(secretsBundle)
+	if err != nil {
+		return nil, err
+	}
+
+	return &GeneratedSecretsResult{
+		Bundle:              string(bundleJSON),
+		MachineSecrets:      machineSecrets,
+		ClusterSecrets:      clusterSecretsJSON,
+		KubernetesSecrets:   kubernetesSecretsJSON,
+		TrustdInfo:          trustdInfoJSON,
+		ClientConfiguration: clientConfiguration,
+	}, nil
+}
+
+func parseVersionContract(talosVersion *string) (*talosconfig.VersionContract, error) {
+	if talosVersion == nil || *talosVersion == "" {
+		return nil, nil
+	}
+
+	versionContract, err := talosconfig.ParseContractFromVersion(*talosVersion)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse talos version")
+	}
+
+	return versionContract, nil
+}
+
+func marshalClusterSecrets(bundle *talossecrets.Bundle) (string, error) {
+	clusterSecretsJSON, err := json.Marshal(map[string]interface{}{
+		"id":     bundle.Cluster.ID,
+		"secret": bundle.Cluster.Secret,
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal cluster secrets")
+	}
+
+	return string(clusterSecretsJSON), nil
+}
+
+func marshalKubernetesSecrets(bundle *talossecrets.Bundle) (string, error) {
+	kubernetesSecretsJSON, err := json.Marshal(map[string]interface{}{
+		"ca": map[string]interface{}{
+			"crt": string(bundle.Certs.K8s.Crt),
+			"key": string(bundle.Certs.K8s.Key),
+		},
+		"aggregatorCA": map[string]interface{}{
+			"crt": string(bundle.Certs.K8sAggregator.Crt),
+			"key": string(bundle.Certs.K8sAggregator.Key),
+		},
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal kubernetes secrets")
+	}
+
+	return string(kubernetesSecretsJSON), nil
+}
+
+func marshalTrustdInfo(bundle *talossecrets.Bundle) (string, error) {
+	trustdInfoJSON, err := json.Marshal(map[string]interface{}{"token": bundle.TrustdInfo.Token})
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal trustd info")
+	}
+
+	return string(trustdInfoJSON), nil
+}
+
+func populateStatus(cr *v1alpha1.Secrets, generatedSecrets *GeneratedSecretsResult) {
+	cr.Status.AtProvider.MachineSecrets = &v1alpha1.MachineSecretsData{
+		Bundle:            generatedSecrets.Bundle,
+		Structured:        generatedSecrets.MachineSecrets,
+		ClusterSecrets:    generatedSecrets.ClusterSecrets,
+		KubernetesSecrets: generatedSecrets.KubernetesSecrets,
+		TrustdInfo:        generatedSecrets.TrustdInfo,
+	}
+	cr.Status.AtProvider.ClientConfiguration = generatedSecrets.ClientConfiguration
+}
+
+func connectionDetailsFromStatus(cr *v1alpha1.Secrets) (managed.ConnectionDetails, error) {
+	connectionDetails := managed.ConnectionDetails{}
+
+	if cr.Status.AtProvider.ClientConfiguration != nil {
+		clientConfigurationJSON, err := marshalBase64ClientConfiguration(cr.Status.AtProvider.ClientConfiguration)
+		if err != nil {
+			return nil, err
+		}
+
+		connectionDetails[connectionKeyCACertificate] = []byte(cr.Status.AtProvider.ClientConfiguration.CACertificate)
+		connectionDetails[connectionKeyClientCertificate] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientCertificate)
+		connectionDetails[connectionKeyClientKey] = []byte(cr.Status.AtProvider.ClientConfiguration.ClientKey)
+		connectionDetails[connectionKeyClientConfiguration] = clientConfigurationJSON
+
+		talosConfig, err := marshalTalosConfig(cr.Status.AtProvider.ClientConfiguration)
+		if err != nil {
+			return nil, err
+		}
+		connectionDetails[connectionKeyTalosConfig] = talosConfig
+	}
+
+	if cr.Status.AtProvider.MachineSecrets != nil {
+		if cr.Status.AtProvider.MachineSecrets.Structured != nil {
+			structuredJSON, err := json.Marshal(cr.Status.AtProvider.MachineSecrets.Structured)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to marshal structured machine secrets")
+			}
+			connectionDetails[connectionKeyMachineSecrets] = structuredJSON
+		}
+		if cr.Status.AtProvider.MachineSecrets.Bundle != "" {
+			connectionDetails[connectionKeyMachineSecretsBundle] = []byte(cr.Status.AtProvider.MachineSecrets.Bundle)
+		}
+	}
+
+	return connectionDetails, nil
+}
+
+func marshalBase64ClientConfiguration(clientConfiguration *v1alpha1.ClientConfiguration) ([]byte, error) {
+	return json.Marshal(v1alpha1.ClientConfiguration{
+		CACertificate:     base64.StdEncoding.EncodeToString([]byte(clientConfiguration.CACertificate)),
+		ClientCertificate: base64.StdEncoding.EncodeToString([]byte(clientConfiguration.ClientCertificate)),
+		ClientKey:         base64.StdEncoding.EncodeToString([]byte(clientConfiguration.ClientKey)),
+	})
+}
+
+func marshalTalosConfig(clientConfiguration *v1alpha1.ClientConfiguration) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"context": "default",
+		"contexts": map[string]interface{}{
+			"default": map[string]interface{}{
+				"ca":  clientConfiguration.CACertificate,
+				"crt": clientConfiguration.ClientCertificate,
+				"key": clientConfiguration.ClientKey,
+			},
+		},
+	})
+}
+
+// SecretsBundleToMachineSecrets converts a Talos SDK bundle to the public structured contract.
+func SecretsBundleToMachineSecrets(bundle *talossecrets.Bundle) (*v1alpha1.MachineSecrets, error) {
+	if err := validateBundleForStructuredSecrets(bundle); err != nil {
+		return nil, err
+	}
+
+	return &v1alpha1.MachineSecrets{
+		Cluster: v1alpha1.MachineSecretsCluster{
+			ID:     bundle.Cluster.ID,
+			Secret: bundle.Cluster.Secret,
+		},
+		Secrets: v1alpha1.MachineSecretsSecrets{
+			BootstrapToken:            bundle.Secrets.BootstrapToken,
+			SecretboxEncryptionSecret: bundle.Secrets.SecretboxEncryptionSecret,
+			AESCBCEncryptionSecret:    bundle.Secrets.AESCBCEncryptionSecret,
+		},
+		TrustdInfo: v1alpha1.MachineSecretsTrustdInfo{Token: bundle.TrustdInfo.Token},
+		Certs: v1alpha1.MachineSecretsCerts{
+			Etcd:              encodeCertificateAndKey(bundle.Certs.Etcd),
+			K8s:               encodeCertificateAndKey(bundle.Certs.K8s),
+			K8sAggregator:     encodeCertificateAndKey(bundle.Certs.K8sAggregator),
+			K8sServiceAccount: encodeKey(bundle.Certs.K8sServiceAccount),
+			OS:                encodeCertificateAndKey(bundle.Certs.OS),
+		},
+	}, nil
+}
+
+func validateBundleForStructuredSecrets(bundle *talossecrets.Bundle) error {
+	if bundle == nil || bundle.Cluster == nil || bundle.Secrets == nil || bundle.TrustdInfo == nil || bundle.Certs == nil {
+		return errors.New("machine secrets bundle is incomplete")
+	}
+
+	return validateBundleCerts(bundle.Certs)
+}
+
+func validateBundleCerts(certs *talossecrets.Certs) error {
+	if certs.Etcd == nil || certs.K8s == nil || certs.K8sAggregator == nil || certs.K8sServiceAccount == nil || certs.OS == nil {
+		return errors.New("machine secrets bundle certificates are incomplete")
+	}
+
+	return nil
+}
+
+// MachineSecretsToSecretsBundle converts the public structured contract back to a Talos SDK bundle.
+func MachineSecretsToSecretsBundle(machineSecrets *v1alpha1.MachineSecrets) (*talossecrets.Bundle, error) {
+	if machineSecrets == nil {
+		return nil, errors.New("machine secrets are nil")
+	}
+
+	etcd, err := decodeCertificateAndKey(machineSecrets.Certs.Etcd)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode etcd certificate and key")
+	}
+	k8s, err := decodeCertificateAndKey(machineSecrets.Certs.K8s)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode k8s certificate and key")
+	}
+	k8sAggregator, err := decodeCertificateAndKey(machineSecrets.Certs.K8sAggregator)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode k8s aggregator certificate and key")
+	}
+	k8sServiceAccount, err := decodeKey(machineSecrets.Certs.K8sServiceAccount)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode k8s service account key")
+	}
+	os, err := decodeCertificateAndKey(machineSecrets.Certs.OS)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode os certificate and key")
+	}
+
+	bundle := &talossecrets.Bundle{
+		Clock: talossecrets.NewClock(),
+		Cluster: &talossecrets.Cluster{
+			ID:     machineSecrets.Cluster.ID,
+			Secret: machineSecrets.Cluster.Secret,
+		},
+		Secrets: &talossecrets.Secrets{
+			BootstrapToken:            machineSecrets.Secrets.BootstrapToken,
+			AESCBCEncryptionSecret:    machineSecrets.Secrets.AESCBCEncryptionSecret,
+			SecretboxEncryptionSecret: machineSecrets.Secrets.SecretboxEncryptionSecret,
+		},
+		TrustdInfo: &talossecrets.TrustdInfo{Token: machineSecrets.TrustdInfo.Token},
+		Certs: &talossecrets.Certs{
+			Etcd:              etcd,
+			K8s:               k8s,
+			K8sAggregator:     k8sAggregator,
+			K8sServiceAccount: k8sServiceAccount,
+			OS:                os,
+		},
+	}
+
+	if err := bundle.Validate(); err != nil {
+		return nil, errors.Wrap(err, "structured machine secrets are invalid")
+	}
+
+	return bundle, nil
+}
+
+// GenerateClientConfiguration creates a Talos API admin client certificate from the OS CA.
+func GenerateClientConfiguration(bundle *talossecrets.Bundle, ttl time.Duration) (*v1alpha1.ClientConfiguration, error) {
+	if bundle == nil || bundle.Certs == nil || bundle.Certs.OS == nil {
+		return nil, errors.New("machine secrets bundle does not contain an OS CA")
+	}
+
+	clientCertificate, err := bundle.GenerateTalosAPIClientCertificateWithTTL(role.MakeSet(role.Admin), ttl)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate Talos API client certificate")
 	}
 
-	// Extract cluster secrets as JSON
-	clusterSecretsData := map[string]interface{}{
-		"id":     secretsBundle.Cluster.ID,
-		"secret": secretsBundle.Cluster.Secret,
-	}
-	clusterSecretsJSON, err := json.Marshal(clusterSecretsData)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal cluster secrets")
-	}
-
-	// Extract Kubernetes secrets as JSON
-	kubernetesSecretsData := map[string]interface{}{
-		"ca": map[string]interface{}{
-			"crt": string(secretsBundle.Certs.K8s.Crt),
-			"key": string(secretsBundle.Certs.K8s.Key),
-		},
-		"aggregatorCA": map[string]interface{}{
-			"crt": string(secretsBundle.Certs.K8sAggregator.Crt),
-			"key": string(secretsBundle.Certs.K8sAggregator.Key),
-		},
-	}
-	kubernetesSecretsJSON, err := json.Marshal(kubernetesSecretsData)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal kubernetes secrets")
-	}
-
-	// Extract TrustD info as JSON
-	trustdInfoData := map[string]interface{}{
-		"token": secretsBundle.TrustdInfo.Token,
-	}
-	trustdInfoJSON, err := json.Marshal(trustdInfoData)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal trustd info")
-	}
-
-	// Create a basic talos config structure
-	talosConfig := map[string]interface{}{
-		"context": "default",
-		"contexts": map[string]interface{}{
-			"default": map[string]interface{}{
-				"ca":  string(secretsBundle.Certs.OS.Crt),
-				"crt": string(clientCertificate.Crt),
-				"key": string(clientCertificate.Key),
-			},
-		},
-	}
-	talosConfigBytes, err := json.Marshal(talosConfig)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal talos config")
-	}
-
-	return &GeneratedSecretsResult{
-		Bundle:            string(bundleJSON),
-		ClusterSecrets:    string(clusterSecretsJSON),
-		KubernetesSecrets: string(kubernetesSecretsJSON),
-		TrustdInfo:        string(trustdInfoJSON),
-		CACertificate:     string(secretsBundle.Certs.OS.Crt),
+	return &v1alpha1.ClientConfiguration{
+		CACertificate:     string(bundle.Certs.OS.Crt),
 		ClientCertificate: string(clientCertificate.Crt),
 		ClientKey:         string(clientCertificate.Key),
-		TalosConfig:       talosConfigBytes,
 	}, nil
+}
+
+func encodeCertificateAndKey(certificateAndKey *siderox509.PEMEncodedCertificateAndKey) v1alpha1.MachineSecretsCertificateAndKey {
+	return v1alpha1.MachineSecretsCertificateAndKey{
+		Cert: base64.StdEncoding.EncodeToString(certificateAndKey.Crt),
+		Key:  base64.StdEncoding.EncodeToString(certificateAndKey.Key),
+	}
+}
+
+func encodeKey(key *siderox509.PEMEncodedKey) v1alpha1.MachineSecretsKey {
+	return v1alpha1.MachineSecretsKey{Key: base64.StdEncoding.EncodeToString(key.Key)}
+}
+
+func decodeCertificateAndKey(certificateAndKey v1alpha1.MachineSecretsCertificateAndKey) (*siderox509.PEMEncodedCertificateAndKey, error) {
+	cert, err := base64.StdEncoding.DecodeString(certificateAndKey.Cert)
+	if err != nil {
+		return nil, err
+	}
+	key, err := base64.StdEncoding.DecodeString(certificateAndKey.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &siderox509.PEMEncodedCertificateAndKey{Crt: cert, Key: key}, nil
+}
+
+func decodeKey(key v1alpha1.MachineSecretsKey) (*siderox509.PEMEncodedKey, error) {
+	decoded, err := base64.StdEncoding.DecodeString(key.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &siderox509.PEMEncodedKey{Key: decoded}, nil
 }

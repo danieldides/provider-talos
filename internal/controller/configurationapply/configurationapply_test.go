@@ -25,6 +25,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,8 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
@@ -110,8 +113,8 @@ func TestObserveUnreachableWithSuccessfulExternalCreate(t *testing.T) {
 	if cr.Status.AtProvider.LastAppliedTime == nil || !cr.Status.AtProvider.LastAppliedTime.Time.Equal(createdAt) {
 		t.Fatalf("cr.Status.AtProvider.LastAppliedTime = %v, want %v", cr.Status.AtProvider.LastAppliedTime, createdAt)
 	}
-	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got != corev1.ConditionTrue {
-		t.Fatalf("Ready condition status = %s, want %s", got, corev1.ConditionTrue)
+	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got == corev1.ConditionTrue {
+		t.Fatalf("Ready condition status = %s, want not %s", got, corev1.ConditionTrue)
 	}
 }
 
@@ -161,7 +164,7 @@ func testConfigurationApply() *v1alpha1.ConfigurationApply {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-apply"},
 		Spec: v1alpha1.ConfigurationApplySpec{ForProvider: v1alpha1.ConfigurationApplyParameters{
 			Node: "127.0.0.1",
-			MachineConfiguration: v1alpha1.MachineConfigurationSpec{
+			MachineConfiguration: &v1alpha1.MachineConfigurationSpec{
 				Version: "v1alpha1",
 				Machine: v1alpha1.MachineSpec{
 					Type:  "controlplane",
@@ -183,6 +186,87 @@ func testConfigurationApply() *v1alpha1.ConfigurationApply {
 			},
 		}},
 	}
+}
+
+func TestResolveMachineConfiguration(t *testing.T) {
+	rawConfig := []byte("version: v1alpha1\ndebug: true\ncluster:\n  apiServer: {}\n")
+
+	tests := map[string]struct {
+		cr      *v1alpha1.ConfigurationApply
+		objects []runtime.Object
+		want    []byte
+		wantErr bool
+	}{
+		"SecretRefReturnsRawBytes": {
+			cr: testConfigurationApplyWithSecretRef("config", "default", "machine_configuration"),
+			objects: []runtime.Object{&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "config", Namespace: "default"},
+				Data:       map[string][]byte{"machine_configuration": rawConfig},
+			}},
+			want: rawConfig,
+		},
+		"MissingSecretErrors": {
+			cr:      testConfigurationApplyWithSecretRef("missing", "default", "machine_configuration"),
+			wantErr: true,
+		},
+		"MissingKeyErrors": {
+			cr: testConfigurationApplyWithSecretRef("config", "default", "machine_configuration"),
+			objects: []runtime.Object{&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "config", Namespace: "default"},
+				Data:       map[string][]byte{"other": rawConfig},
+			}},
+			wantErr: true,
+		},
+		"EmptyKeyErrors": {
+			cr: testConfigurationApplyWithSecretRef("config", "default", "machine_configuration"),
+			objects: []runtime.Object{&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "config", Namespace: "default"},
+				Data:       map[string][]byte{"machine_configuration": {}},
+			}},
+			wantErr: true,
+		},
+		"StructuredFallbackRendersYAML": {
+			cr:   testConfigurationApply(),
+			want: []byte("version: v1alpha1"),
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatalf("corev1.AddToScheme(...): %v", err)
+			}
+
+			e := external{kube: ctrlfake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.objects...).Build()}
+			got, err := e.resolveMachineConfiguration(context.Background(), tc.cr)
+			if tc.wantErr && err == nil {
+				t.Fatal("resolveMachineConfiguration(...): expected error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("resolveMachineConfiguration(...): unexpected error: %v", err)
+			}
+			if tc.wantErr {
+				return
+			}
+			if name == "StructuredFallbackRendersYAML" {
+				if !strings.Contains(string(got), string(tc.want)) {
+					t.Fatalf("resolveMachineConfiguration(...) = %q, want to contain %q", got, tc.want)
+				}
+				return
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("resolveMachineConfiguration(...): -want, +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func testConfigurationApplyWithSecretRef(name, namespace, key string) *v1alpha1.ConfigurationApply {
+	cr := testConfigurationApply()
+	cr.Spec.ForProvider.MachineConfiguration = nil
+	cr.Spec.ForProvider.MachineConfigurationRef = &v1alpha1.SecretKeyReference{Name: name, Namespace: namespace, Key: key}
+	return cr
 }
 
 func TestGetConfigurationApplyMode(t *testing.T) {

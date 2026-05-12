@@ -249,6 +249,24 @@ spec:
                     - machine
                     - version
                     type: object
+                  machineConfigurationRef:
+                    description: MachineConfigurationRef references raw Talos machine
+                      configuration bytes in a Secret.
+                    properties:
+                      key:
+                        description: Key is the data key containing the value.
+                        type: string
+                      name:
+                        description: Name is the name of the Secret.
+                        type: string
+                      namespace:
+                        description: Namespace is the namespace of the Secret.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    - namespace
+                    type: object
                   node:
                     description: Node is the target machine identifier (required)
                     type: string
@@ -258,9 +276,12 @@ spec:
                     type: string
                 required:
                 - clientConfiguration
-                - machineConfiguration
                 - node
                 type: object
+                x-kubernetes-validations:
+                - message: machineConfigurationRef or machineConfiguration must be
+                    set
+                  rule: has(self.machineConfigurationRef) || has(self.machineConfiguration)
               managementPolicies:
                 default:
                 - '*'
