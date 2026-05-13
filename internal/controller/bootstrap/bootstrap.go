@@ -19,6 +19,7 @@ package bootstrap
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -269,17 +270,9 @@ func (c *external) bootstrapTalosCluster(ctx context.Context, cr *v1alpha1.Boots
 		)
 	} else {
 		fmt.Printf("Using secure connection to %s\n", endpoint)
-		// Create a certificate from the provided certificates
-		cert, certErr := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
-		if certErr != nil {
-			return errors.Wrap(certErr, "failed to create client certificate")
-		}
-
-		// Create TLS config
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ServerName:   cr.Spec.ForProvider.Node, // Use node IP as server name
-			MinVersion:   tls.VersionTLS12,
+		tlsConfig, configErr := buildBootstrapTLSConfig(clientConfig, cr.Spec.ForProvider.Node)
+		if configErr != nil {
+			return configErr
 		}
 
 		// Create Talos client
@@ -304,4 +297,27 @@ func (c *external) bootstrapTalosCluster(ctx context.Context, cr *v1alpha1.Boots
 
 	fmt.Printf("Successfully bootstrapped Talos cluster on endpoint %s\n", endpoint)
 	return nil
+}
+
+func buildBootstrapTLSConfig(clientConfig v1alpha1.ClientConfiguration, node string) (*tls.Config, error) {
+	cert, err := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create client certificate")
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ServerName:   node,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	if clientConfig.CACertificate != "" && clientConfig.CACertificate != "insecure" {
+		roots := x509.NewCertPool()
+		if ok := roots.AppendCertsFromPEM([]byte(clientConfig.CACertificate)); !ok {
+			return nil, errors.New("failed to parse CA certificate")
+		}
+		tlsConfig.RootCAs = roots
+	}
+
+	return tlsConfig, nil
 }
