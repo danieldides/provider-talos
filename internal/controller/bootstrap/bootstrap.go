@@ -21,9 +21,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"strings"
+	"time"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
@@ -36,6 +41,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
@@ -53,6 +59,8 @@ const (
 	errGetCreds     = "cannot get credentials"
 
 	errNewClient = "cannot create new Service"
+
+	certInsecure = "insecure"
 )
 
 // A NoOpService does nothing.
@@ -158,6 +166,10 @@ type external struct {
 	// A 'client' used to connect to the external resource API. In practice this
 	// would be something like an AWS SDK client.
 	service interface{}
+	// bootstrapFn allows tests to stub the non-idempotent Talos bootstrap call.
+	bootstrapFn func(context.Context, *v1alpha1.Bootstrap) error
+	// isBootstrappedHealthyFn allows tests to stub already-bootstrapped detection.
+	isBootstrappedHealthyFn func(context.Context, *v1alpha1.Bootstrap) bool
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
@@ -168,21 +180,21 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	fmt.Printf("Observing Bootstrap: %s\n", cr.Name)
 
-	// Check if cluster has been bootstrapped
-	clusterBootstrapped := cr.Status.AtProvider.Bootstrapped
-	bootstrapTimeExists := cr.Status.AtProvider.BootstrapTime != nil
+	bootstrapped := resolveBootstrappedStatus(cr)
+	if bootstrapped {
+		cr.SetConditions(xpv1.Available())
+	}
 
-	// Resource exists if we have bootstrapped the cluster
-	resourceExists := clusterBootstrapped && bootstrapTimeExists
+	if !bootstrapped && c.isBootstrappedHealthy(ctx, cr) {
+		markBootstrapped(cr, metav1.Now())
+		bootstrapped = true
+	}
 
-	// Resource is up to date if it exists
-	resourceUpToDate := resourceExists
-
-	fmt.Printf("Bootstrap exists: %v, up to date: %v\n", resourceExists, resourceUpToDate)
+	fmt.Printf("Bootstrap exists: %v, up to date: %v\n", bootstrapped, bootstrapped)
 
 	return managed.ExternalObservation{
-		ResourceExists:    resourceExists,
-		ResourceUpToDate:  resourceUpToDate,
+		ResourceExists:    bootstrapped,
+		ResourceUpToDate:  bootstrapped,
 		ConnectionDetails: managed.ConnectionDetails{},
 	}, nil
 }
@@ -196,15 +208,22 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	fmt.Printf("Bootstrapping Talos cluster on node: %s\n", cr.Spec.ForProvider.Node)
 
 	// Bootstrap the Talos cluster
-	err := c.bootstrapTalosCluster(ctx, cr)
+	err := c.bootstrap(ctx, cr)
 	if err != nil {
+		if isBootstrapAlreadyExists(err) && c.isBootstrappedHealthy(ctx, cr) {
+			markBootstrapped(cr, metav1.Now())
+			return managed.ExternalCreation{
+				ConnectionDetails: managed.ConnectionDetails{},
+			}, nil
+		}
+		if isBootstrapAlreadyExists(err) {
+			return managed.ExternalCreation{}, errors.Wrap(err, "bootstrap already exists but node health could not be verified")
+		}
+
 		return managed.ExternalCreation{}, errors.Wrap(err, "failed to bootstrap Talos cluster")
 	}
 
-	// Update status
-	cr.Status.AtProvider.Bootstrapped = true
-	now := metav1.Now()
-	cr.Status.AtProvider.BootstrapTime = &now
+	markBootstrapped(cr, metav1.Now())
 
 	return managed.ExternalCreation{
 		ConnectionDetails: managed.ConnectionDetails{},
@@ -241,6 +260,97 @@ func (c *external) Disconnect(ctx context.Context) error {
 	return nil
 }
 
+func (c *external) bootstrap(ctx context.Context, cr *v1alpha1.Bootstrap) error {
+	if c.bootstrapFn != nil {
+		return c.bootstrapFn(ctx, cr)
+	}
+
+	return c.bootstrapTalosCluster(ctx, cr)
+}
+
+func resolveBootstrappedStatus(cr *v1alpha1.Bootstrap) bool {
+	bootstrapped := cr.Status.AtProvider.Bootstrapped || hasSuccessfulExternalCreate(cr)
+	if !bootstrapped {
+		return false
+	}
+
+	if cr.Status.AtProvider.BootstrapTime == nil {
+		if t := meta.GetExternalCreateSucceeded(cr); !t.IsZero() {
+			bootstrapTime := metav1.NewTime(t)
+			cr.Status.AtProvider.BootstrapTime = &bootstrapTime
+		}
+	}
+	if cr.Status.AtProvider.BootstrapTime == nil {
+		now := metav1.Now()
+		cr.Status.AtProvider.BootstrapTime = &now
+	}
+	cr.Status.AtProvider.Bootstrapped = true
+
+	return true
+}
+
+func hasSuccessfulExternalCreate(cr *v1alpha1.Bootstrap) bool {
+	return cr.GetAnnotations()[meta.AnnotationKeyExternalCreateSucceeded] != ""
+}
+
+func markBootstrapped(cr *v1alpha1.Bootstrap, when metav1.Time) {
+	cr.Status.AtProvider.Bootstrapped = true
+	cr.Status.AtProvider.BootstrapTime = &when
+	cr.SetConditions(xpv1.Available())
+}
+
+func isBootstrapAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(errors.Cause(err)) == codes.AlreadyExists || status.Code(err) == codes.AlreadyExists {
+		return true
+	}
+
+	errText := err.Error()
+	return strings.Contains(errText, "AlreadyExists") || strings.Contains(errText, "etcd data directory is not empty")
+}
+
+func (c *external) isBootstrappedHealthy(ctx context.Context, cr *v1alpha1.Bootstrap) bool {
+	if c.isBootstrappedHealthyFn != nil {
+		return c.isBootstrappedHealthyFn(ctx, cr)
+	}
+
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	clientConfig := cr.Spec.ForProvider.ClientConfiguration
+	if clientConfig.ClientCertificate == "" {
+		return false
+	}
+
+	endpoint := getBootstrapEndpoint(cr)
+	var tlsConfig *tls.Config
+	if clientConfig.ClientCertificate == certInsecure || clientConfig.CACertificate == certInsecure {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance-mode machines.
+		}
+	} else {
+		var err error
+		tlsConfig, err = buildBootstrapTLSConfig(clientConfig, cr.Spec.ForProvider.Node)
+		if err != nil {
+			return false
+		}
+	}
+
+	talosClient, err := talosclient.New(checkCtx,
+		talosclient.WithTLSConfig(tlsConfig),
+		talosclient.WithEndpoints(endpoint),
+	)
+	if err != nil {
+		return false
+	}
+	defer talosClient.Close() //nolint:errcheck
+
+	_, err = talosClient.Version(checkCtx)
+	return err == nil
+}
+
 // bootstrapTalosCluster bootstraps the Talos cluster on the specified control plane node
 func (c *external) bootstrapTalosCluster(ctx context.Context, cr *v1alpha1.Bootstrap) error {
 	// Get client configuration
@@ -249,17 +359,13 @@ func (c *external) bootstrapTalosCluster(ctx context.Context, cr *v1alpha1.Boots
 		return errors.New("clientConfiguration is required")
 	}
 
-	// Determine endpoint - use provided endpoint or default to node:50000
-	endpoint := cr.Spec.ForProvider.Node + ":50000"
-	if cr.Spec.ForProvider.Endpoint != nil && *cr.Spec.ForProvider.Endpoint != "" {
-		endpoint = *cr.Spec.ForProvider.Endpoint
-	}
+	endpoint := getBootstrapEndpoint(cr)
 
 	// Handle insecure mode (when certificates are "insecure")
 	var talosClient *talosclient.Client
 	var err error
 
-	if clientConfig.ClientCertificate == "insecure" || clientConfig.CACertificate == "insecure" {
+	if clientConfig.ClientCertificate == certInsecure || clientConfig.CACertificate == certInsecure {
 		fmt.Printf("Using insecure connection to %s\n", endpoint)
 		// Create insecure client
 		talosClient, err = talosclient.New(ctx,
@@ -299,6 +405,15 @@ func (c *external) bootstrapTalosCluster(ctx context.Context, cr *v1alpha1.Boots
 	return nil
 }
 
+func getBootstrapEndpoint(cr *v1alpha1.Bootstrap) string {
+	endpoint := cr.Spec.ForProvider.Node + ":50000"
+	if cr.Spec.ForProvider.Endpoint != nil && *cr.Spec.ForProvider.Endpoint != "" {
+		endpoint = *cr.Spec.ForProvider.Endpoint
+	}
+
+	return endpoint
+}
+
 func buildBootstrapTLSConfig(clientConfig v1alpha1.ClientConfiguration, node string) (*tls.Config, error) {
 	cert, err := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
 	if err != nil {
@@ -311,7 +426,7 @@ func buildBootstrapTLSConfig(clientConfig v1alpha1.ClientConfiguration, node str
 		MinVersion:   tls.VersionTLS12,
 	}
 
-	if clientConfig.CACertificate != "" && clientConfig.CACertificate != "insecure" {
+	if clientConfig.CACertificate != "" && clientConfig.CACertificate != certInsecure {
 		roots := x509.NewCertPool()
 		if ok := roots.AppendCertsFromPEM([]byte(clientConfig.CACertificate)); !ok {
 			return nil, errors.New("failed to parse CA certificate")

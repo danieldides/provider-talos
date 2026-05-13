@@ -29,7 +29,14 @@ import (
 	"testing"
 	"time"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/google/go-cmp/cmp"
+	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/crossplane-contrib/provider-talos/apis/machine/v1alpha1"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
@@ -78,6 +85,171 @@ func TestObserve(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.want.o, got); diff != "" {
 				t.Errorf("\n%s\ne.Observe(...): -want, +got:\n%s\n", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestObserveWithSuccessfulExternalCreate(t *testing.T) {
+	createdAt := time.Date(2026, 5, 13, 20, 29, 41, 0, time.UTC)
+	cr := testBootstrap()
+	meta.SetExternalCreateSucceeded(cr, createdAt)
+
+	e := external{isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return false }}
+	got, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Observe(...): unexpected error: %v", err)
+	}
+
+	if !got.ResourceExists {
+		t.Fatal("e.Observe(...).ResourceExists = false, want true")
+	}
+	if !got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = false, want true")
+	}
+	if !cr.Status.AtProvider.Bootstrapped {
+		t.Fatal("cr.Status.AtProvider.Bootstrapped = false, want true")
+	}
+	if cr.Status.AtProvider.BootstrapTime == nil || !cr.Status.AtProvider.BootstrapTime.Time.Equal(createdAt) {
+		t.Fatalf("cr.Status.AtProvider.BootstrapTime = %v, want %v", cr.Status.AtProvider.BootstrapTime, createdAt)
+	}
+	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got != corev1.ConditionTrue {
+		t.Fatalf("Ready condition status = %s, want %s", got, corev1.ConditionTrue)
+	}
+}
+
+func TestObserveAlreadyHealthyWithoutStatus(t *testing.T) {
+	cr := testBootstrap()
+	e := external{isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return true }}
+
+	got, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Observe(...): unexpected error: %v", err)
+	}
+
+	if !got.ResourceExists {
+		t.Fatal("e.Observe(...).ResourceExists = false, want true")
+	}
+	if !got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = false, want true")
+	}
+	if !cr.Status.AtProvider.Bootstrapped {
+		t.Fatal("cr.Status.AtProvider.Bootstrapped = false, want true")
+	}
+	if cr.Status.AtProvider.BootstrapTime == nil {
+		t.Fatal("cr.Status.AtProvider.BootstrapTime = nil, want timestamp")
+	}
+}
+
+func TestObserveMissingAndUnhealthy(t *testing.T) {
+	cr := testBootstrap()
+	e := external{isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return false }}
+
+	got, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Observe(...): unexpected error: %v", err)
+	}
+
+	if got.ResourceExists {
+		t.Fatal("e.Observe(...).ResourceExists = true, want false")
+	}
+	if got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = true, want false")
+	}
+	if cr.Status.AtProvider.Bootstrapped {
+		t.Fatal("cr.Status.AtProvider.Bootstrapped = true, want false")
+	}
+}
+
+func TestCreateAlreadyExistsHealthyIsSuccess(t *testing.T) {
+	cr := testBootstrap()
+	e := external{
+		bootstrapFn: func(context.Context, *v1alpha1.Bootstrap) error {
+			return status.Error(codes.AlreadyExists, "etcd data directory is not empty")
+		},
+		isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return true },
+	}
+
+	_, err := e.Create(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Create(...): unexpected error: %v", err)
+	}
+	if !cr.Status.AtProvider.Bootstrapped {
+		t.Fatal("cr.Status.AtProvider.Bootstrapped = false, want true")
+	}
+	if cr.Status.AtProvider.BootstrapTime == nil {
+		t.Fatal("cr.Status.AtProvider.BootstrapTime = nil, want timestamp")
+	}
+	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got != corev1.ConditionTrue {
+		t.Fatalf("Ready condition status = %s, want %s", got, corev1.ConditionTrue)
+	}
+}
+
+func TestCreateAlreadyExistsUnhealthyReturnsError(t *testing.T) {
+	cr := testBootstrap()
+	e := external{
+		bootstrapFn: func(context.Context, *v1alpha1.Bootstrap) error {
+			return status.Error(codes.AlreadyExists, "etcd data directory is not empty")
+		},
+		isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return false },
+	}
+
+	_, err := e.Create(context.Background(), cr)
+	if err == nil {
+		t.Fatal("e.Create(...): expected error")
+	}
+	if !strings.Contains(err.Error(), "health could not be verified") {
+		t.Fatalf("e.Create(...): got error %q, want health verification context", err.Error())
+	}
+}
+
+func TestCreateNonAlreadyExistsReturnsError(t *testing.T) {
+	cr := testBootstrap()
+	e := external{
+		bootstrapFn:             func(context.Context, *v1alpha1.Bootstrap) error { return errors.New("permission denied") },
+		isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return true },
+	}
+
+	_, err := e.Create(context.Background(), cr)
+	if err == nil {
+		t.Fatal("e.Create(...): expected error")
+	}
+	if !strings.Contains(err.Error(), "failed to bootstrap Talos cluster") {
+		t.Fatalf("e.Create(...): got error %q, want bootstrap failure context", err.Error())
+	}
+}
+
+func TestIsBootstrapAlreadyExists(t *testing.T) {
+	tests := map[string]struct {
+		err  error
+		want bool
+	}{
+		"Nil": {
+			want: false,
+		},
+		"GRPCAlreadyExists": {
+			err:  status.Error(codes.AlreadyExists, "etcd data directory is not empty"),
+			want: true,
+		},
+		"WrappedGRPCAlreadyExists": {
+			err:  errors.Wrap(status.Error(codes.AlreadyExists, "etcd data directory is not empty"), "failed to bootstrap Talos cluster"),
+			want: true,
+		},
+		"KnownMessage": {
+			err:  errors.New("rpc error: code = AlreadyExists desc = etcd data directory is not empty"),
+			want: true,
+		},
+		"Unrelated": {
+			err:  errors.New("connection refused"),
+			want: false,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := isBootstrapAlreadyExists(tc.err)
+			if got != tc.want {
+				t.Fatalf("isBootstrapAlreadyExists(...): got %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -165,6 +337,18 @@ func TestBuildBootstrapTLSConfig(t *testing.T) {
 				tc.check(t, got)
 			}
 		})
+	}
+}
+
+func testBootstrap() *v1alpha1.Bootstrap {
+	return &v1alpha1.Bootstrap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-bootstrap"},
+		Spec: v1alpha1.BootstrapSpec{ForProvider: v1alpha1.BootstrapParameters{
+			Node: "127.0.0.1",
+			ClientConfiguration: v1alpha1.ClientConfiguration{
+				ClientCertificate: "insecure",
+			},
+		}},
 	}
 }
 
