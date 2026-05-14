@@ -20,9 +20,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"math/big"
 	"strings"
@@ -255,49 +255,18 @@ func TestIsBootstrapAlreadyExists(t *testing.T) {
 	}
 }
 
-func TestBuildBootstrapTLSConfig(t *testing.T) {
+func TestBuildBootstrapClientConfig(t *testing.T) {
 	caCert, clientCert, clientKey := generateTestCertificates(t)
 
 	tests := map[string]struct {
 		clientConfig v1alpha1.ClientConfiguration
-		node         string
-		check        func(t *testing.T, cfg *tls.Config)
 		wantErr      string
 	}{
-		"SecureWithCA": {
+		"SecureWithPEMValues": {
 			clientConfig: v1alpha1.ClientConfiguration{
 				CACertificate:     caCert,
 				ClientCertificate: clientCert,
 				ClientKey:         clientKey,
-			},
-			node: "127.0.0.1",
-			check: func(t *testing.T, cfg *tls.Config) {
-				t.Helper()
-				if len(cfg.Certificates) != 1 {
-					t.Fatalf("buildBootstrapTLSConfig(...): got %d certificates, want 1", len(cfg.Certificates))
-				}
-				if cfg.RootCAs == nil {
-					t.Fatal("buildBootstrapTLSConfig(...): RootCAs = nil")
-				}
-				if diff := cmp.Diff("127.0.0.1", cfg.ServerName); diff != "" {
-					t.Errorf("buildBootstrapTLSConfig(...).ServerName: -want, +got:\n%s", diff)
-				}
-				if diff := cmp.Diff(uint16(tls.VersionTLS12), cfg.MinVersion); diff != "" {
-					t.Errorf("buildBootstrapTLSConfig(...).MinVersion: -want, +got:\n%s", diff)
-				}
-			},
-		},
-		"InsecureCACertificateSkipsRootCAs": {
-			clientConfig: v1alpha1.ClientConfiguration{
-				CACertificate:     "insecure",
-				ClientCertificate: clientCert,
-				ClientKey:         clientKey,
-			},
-			check: func(t *testing.T, cfg *tls.Config) {
-				t.Helper()
-				if cfg.RootCAs != nil {
-					t.Fatal("buildBootstrapTLSConfig(...): RootCAs != nil")
-				}
 			},
 		},
 		"InvalidCAErrors": {
@@ -316,27 +285,73 @@ func TestBuildBootstrapTLSConfig(t *testing.T) {
 			},
 			wantErr: "failed to create client certificate",
 		},
+		"MissingCACertificateErrors": {
+			clientConfig: v1alpha1.ClientConfiguration{
+				ClientCertificate: clientCert,
+				ClientKey:         clientKey,
+			},
+			wantErr: "clientConfiguration.caCertificate is required",
+		},
+		"MissingClientCertificateErrors": {
+			clientConfig: v1alpha1.ClientConfiguration{
+				CACertificate: caCert,
+				ClientKey:     clientKey,
+			},
+			wantErr: "clientConfiguration.clientCertificate is required",
+		},
+		"MissingClientKeyErrors": {
+			clientConfig: v1alpha1.ClientConfiguration{
+				CACertificate:     caCert,
+				ClientCertificate: clientCert,
+			},
+			wantErr: "clientConfiguration.clientKey is required",
+		},
 	}
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			got, err := buildBootstrapTLSConfig(tc.clientConfig, tc.node)
+			got, err := buildBootstrapClientConfig(tc.clientConfig)
 			if tc.wantErr != "" {
 				if err == nil {
-					t.Fatal("buildBootstrapTLSConfig(...): expected error")
+					t.Fatal("buildBootstrapClientConfig(...): expected error")
 				}
 				if !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("buildBootstrapTLSConfig(...): got error %q, want to contain %q", err.Error(), tc.wantErr)
+					t.Fatalf("buildBootstrapClientConfig(...): got error %q, want to contain %q", err.Error(), tc.wantErr)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("buildBootstrapTLSConfig(...): unexpected error: %v", err)
+				t.Fatalf("buildBootstrapClientConfig(...): unexpected error: %v", err)
 			}
-			if tc.check != nil {
-				tc.check(t, got)
+			if diff := cmp.Diff("dynamic", got.Context); diff != "" {
+				t.Errorf("buildBootstrapClientConfig(...).Context: -want, +got:\n%s", diff)
+			}
+			if len(got.Contexts) != 1 {
+				t.Fatalf("buildBootstrapClientConfig(...): got %d contexts, want 1", len(got.Contexts))
+			}
+			ctx := got.Contexts["dynamic"]
+			if ctx == nil {
+				t.Fatal("buildBootstrapClientConfig(...).Contexts[dynamic] = nil")
+			}
+			assertBase64Value(t, "CA", ctx.CA, tc.clientConfig.CACertificate)
+			assertBase64Value(t, "Crt", ctx.Crt, tc.clientConfig.ClientCertificate)
+			assertBase64Value(t, "Key", ctx.Key, tc.clientConfig.ClientKey)
+			if len(ctx.Endpoints) != 0 {
+				t.Fatalf("buildBootstrapClientConfig(...).Contexts[dynamic].Endpoints = %v, want empty", ctx.Endpoints)
 			}
 		})
+	}
+}
+
+func assertBase64Value(t *testing.T, field, got, wantDecoded string) {
+	t.Helper()
+
+	decoded, err := base64.StdEncoding.DecodeString(got)
+	if err != nil {
+		t.Fatalf("%s is not base64 encoded: %v", field, err)
+	}
+	if diff := cmp.Diff(wantDecoded, string(decoded)); diff != "" {
+		t.Fatalf("%s decoded value: -want, +got:\n%s", field, diff)
 	}
 }
 
