@@ -25,8 +25,10 @@ import (
 	"time"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+	siderox509 "github.com/siderolabs/crypto/x509"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
+	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -325,29 +327,32 @@ func (c *external) isBootstrappedHealthy(ctx context.Context, cr *v1alpha1.Boots
 	}
 
 	endpoint := getBootstrapEndpoint(cr)
-	var tlsConfig *tls.Config
+	var talosClient *talosclient.Client
+	var err error
 	if clientConfig.ClientCertificate == certInsecure || clientConfig.CACertificate == certInsecure {
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance-mode machines.
-		}
+		talosClient, err = talosclient.New(checkCtx,
+			talosclient.WithTLSConfig(&tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // Insecure mode needed for maintenance-mode machines.
+			}),
+			talosclient.WithEndpoints(endpoint),
+		)
 	} else {
-		var err error
-		tlsConfig, err = buildBootstrapTLSConfig(clientConfig, cr.Spec.ForProvider.Node)
-		if err != nil {
+		talosConfig, configErr := buildBootstrapClientConfig(clientConfig)
+		if configErr != nil {
 			return false
 		}
-	}
 
-	talosClient, err := talosclient.New(checkCtx,
-		talosclient.WithTLSConfig(tlsConfig),
-		talosclient.WithEndpoints(endpoint),
-	)
+		talosClient, err = talosclient.New(checkCtx,
+			talosclient.WithConfig(talosConfig),
+			talosclient.WithEndpoints(endpoint),
+		)
+	}
 	if err != nil {
 		return false
 	}
 	defer talosClient.Close() //nolint:errcheck
 
-	_, err = talosClient.Version(checkCtx)
+	_, err = talosClient.Version(talosclient.WithNode(checkCtx, cr.Spec.ForProvider.Node))
 	return err == nil
 }
 
@@ -376,14 +381,14 @@ func (c *external) bootstrapTalosCluster(ctx context.Context, cr *v1alpha1.Boots
 		)
 	} else {
 		fmt.Printf("Using secure connection to %s\n", endpoint)
-		tlsConfig, configErr := buildBootstrapTLSConfig(clientConfig, cr.Spec.ForProvider.Node)
+		talosConfig, configErr := buildBootstrapClientConfig(clientConfig)
 		if configErr != nil {
 			return configErr
 		}
 
 		// Create Talos client
 		talosClient, err = talosclient.New(ctx,
-			talosclient.WithTLSConfig(tlsConfig),
+			talosclient.WithConfig(talosConfig),
 			talosclient.WithEndpoints(endpoint),
 		)
 	}
@@ -396,7 +401,7 @@ func (c *external) bootstrapTalosCluster(ctx context.Context, cr *v1alpha1.Boots
 	fmt.Printf("Attempting to bootstrap Talos cluster on endpoint %s\n", endpoint)
 
 	// Bootstrap the cluster
-	err = talosClient.Bootstrap(ctx, &machine.BootstrapRequest{})
+	err = talosClient.Bootstrap(talosclient.WithNode(ctx, cr.Spec.ForProvider.Node), &machine.BootstrapRequest{})
 	if err != nil {
 		return errors.Wrap(err, "failed to bootstrap Talos cluster")
 	}
@@ -414,25 +419,32 @@ func getBootstrapEndpoint(cr *v1alpha1.Bootstrap) string {
 	return endpoint
 }
 
-func buildBootstrapTLSConfig(clientConfig v1alpha1.ClientConfiguration, node string) (*tls.Config, error) {
+func buildBootstrapClientConfig(clientConfig v1alpha1.ClientConfiguration) (*clientconfig.Config, error) {
+	if clientConfig.ClientCertificate == "" {
+		return nil, errors.New("clientConfiguration.clientCertificate is required")
+	}
+	if clientConfig.ClientKey == "" {
+		return nil, errors.New("clientConfiguration.clientKey is required")
+	}
+	if clientConfig.CACertificate == "" {
+		return nil, errors.New("clientConfiguration.caCertificate is required")
+	}
+
 	cert, err := tls.X509KeyPair([]byte(clientConfig.ClientCertificate), []byte(clientConfig.ClientKey))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create client certificate")
 	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ServerName:   node,
-		MinVersion:   tls.VersionTLS12,
+	if len(cert.Certificate) == 0 {
+		return nil, errors.New("failed to create client certificate")
 	}
 
-	if clientConfig.CACertificate != "" && clientConfig.CACertificate != certInsecure {
-		roots := x509.NewCertPool()
-		if ok := roots.AppendCertsFromPEM([]byte(clientConfig.CACertificate)); !ok {
-			return nil, errors.New("failed to parse CA certificate")
-		}
-		tlsConfig.RootCAs = roots
+	roots := x509.NewCertPool()
+	if ok := roots.AppendCertsFromPEM([]byte(clientConfig.CACertificate)); !ok {
+		return nil, errors.New("failed to parse CA certificate")
 	}
 
-	return tlsConfig, nil
+	return clientconfig.NewConfig("dynamic", nil, []byte(clientConfig.CACertificate), &siderox509.PEMEncodedCertificateAndKey{
+		Crt: []byte(clientConfig.ClientCertificate),
+		Key: []byte(clientConfig.ClientKey),
+	}), nil
 }
