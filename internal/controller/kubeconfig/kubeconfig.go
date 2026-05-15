@@ -23,10 +23,15 @@ import (
 
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -50,6 +55,12 @@ const (
 	errGetCreds      = "cannot get credentials"
 
 	errNewClient = "cannot create new Service"
+
+	connectionKeyKubeconfig        = "kubeconfig"
+	connectionKeyHost              = "host"
+	connectionKeyCACertificate     = "caCertificate"
+	connectionKeyClientCertificate = "clientCertificate"
+	connectionKeyClientKey         = "clientKey"
 )
 
 // A NoOpService does nothing.
@@ -146,7 +157,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errNewClient)
 	}
 
-	return &external{service: svc}, nil
+	return &external{kube: c.kube, service: svc}, nil
 }
 
 // An ExternalClient observes, then either creates, updates, or deletes an
@@ -154,7 +165,9 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 type external struct {
 	// A 'client' used to connect to the external resource API. In practice this
 	// would be something like an AWS SDK client.
-	service interface{}
+	kube                 ctrlclient.Client
+	service              interface{}
+	retrieveKubeconfigFn func(context.Context, *v1alpha1.Kubeconfig) (string, error)
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
@@ -165,23 +178,56 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	fmt.Printf("Observing Kubeconfig: %s\n", cr.Name)
 
-	// Check if kubeconfig has been retrieved (use existing fields)
-	// Since these fields don't exist, we'll use a simple heuristic
-	kubeconfigRetrieved := false // For now, always false to trigger creation
-	retrievedTimeExists := true  // Always true since we don't have this field
+	ref := cr.GetWriteConnectionSecretToReference()
+	if ref == nil || ref.Name == "" || ref.Namespace == "" || c.kube == nil {
+		fmt.Printf("Kubeconfig exists: %v, up to date: %v\n", false, false)
 
-	// Resource exists if we have retrieved the kubeconfig
-	resourceExists := kubeconfigRetrieved && retrievedTimeExists
+		return managed.ExternalObservation{
+			ResourceExists:    false,
+			ResourceUpToDate:  false,
+			ConnectionDetails: managed.ConnectionDetails{},
+		}, nil
+	}
 
-	// Resource is up to date if it exists
-	resourceUpToDate := resourceExists
+	secret := &corev1.Secret{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			fmt.Printf("Kubeconfig exists: %v, up to date: %v\n", false, false)
 
-	fmt.Printf("Kubeconfig exists: %v, up to date: %v\n", resourceExists, resourceUpToDate)
+			return managed.ExternalObservation{
+				ResourceExists:    false,
+				ResourceUpToDate:  false,
+				ConnectionDetails: managed.ConnectionDetails{},
+			}, nil
+		}
+
+		return managed.ExternalObservation{}, err
+	}
+
+	kubeconfigData := secret.Data[connectionKeyKubeconfig]
+	if len(kubeconfigData) == 0 {
+		fmt.Printf("Kubeconfig exists: %v, up to date: %v\n", false, false)
+
+		return managed.ExternalObservation{
+			ResourceExists:    false,
+			ResourceUpToDate:  false,
+			ConnectionDetails: managed.ConnectionDetails{},
+		}, nil
+	}
+
+	clientConfiguration, err := parseKubeconfig(string(kubeconfigData))
+	if err != nil {
+		return managed.ExternalObservation{}, err
+	}
+
+	cr.Status.AtProvider.KubernetesClientConfiguration = clientConfiguration
+	cr.SetConditions(xpv1.Available())
+	fmt.Printf("Kubeconfig exists: %v, up to date: %v\n", true, true)
 
 	return managed.ExternalObservation{
-		ResourceExists:    resourceExists,
-		ResourceUpToDate:  resourceUpToDate,
-		ConnectionDetails: managed.ConnectionDetails{},
+		ResourceExists:    true,
+		ResourceUpToDate:  true,
+		ConnectionDetails: connectionDetails(string(kubeconfigData), clientConfiguration),
 	}, nil
 }
 
@@ -193,20 +239,18 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	fmt.Printf("Retrieving kubeconfig from node: %s\n", cr.Spec.ForProvider.Node)
 
-	// Retrieve the kubeconfig from the Talos cluster
 	kubeconfigData, err := c.retrieveKubeconfig(ctx, cr)
 	if err != nil {
 		return managed.ExternalCreation{}, errors.Wrap(err, "failed to retrieve kubeconfig")
 	}
 
-	// Update status
-	// Note: Retrieved and LastRetrievedTime fields don't exist in the generated API, skipping
+	clientConfiguration, err := parseKubeconfig(kubeconfigData)
+	if err != nil {
+		return managed.ExternalCreation{}, errors.Wrap(err, "failed to parse kubeconfig")
+	}
 
-	// Return kubeconfig as connection details
 	return managed.ExternalCreation{
-		ConnectionDetails: managed.ConnectionDetails{
-			"kubeconfig": []byte(kubeconfigData),
-		},
+		ConnectionDetails: connectionDetails(kubeconfigData, clientConfiguration),
 	}, nil
 }
 
@@ -218,30 +262,26 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	fmt.Printf("Updating kubeconfig from node: %s\n", cr.Spec.ForProvider.Node)
 
-	// Re-retrieve the kubeconfig from the Talos cluster
 	kubeconfigData, err := c.retrieveKubeconfig(ctx, cr)
 	if err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to retrieve kubeconfig")
 	}
 
-	// Update status
-	// Note: Retrieved and LastRetrievedTime fields don't exist in the generated API, skipping
+	clientConfiguration, err := parseKubeconfig(kubeconfigData)
+	if err != nil {
+		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to parse kubeconfig")
+	}
 
-	// Return updated kubeconfig as connection details
 	return managed.ExternalUpdate{
-		ConnectionDetails: managed.ConnectionDetails{
-			"kubeconfig": []byte(kubeconfigData),
-		},
+		ConnectionDetails: connectionDetails(kubeconfigData, clientConfiguration),
 	}, nil
 }
 
 func (c *external) Delete(ctx context.Context, mg resource.Managed) (managed.ExternalDelete, error) {
-	cr, ok := mg.(*v1alpha1.Kubeconfig)
+	_, ok := mg.(*v1alpha1.Kubeconfig)
 	if !ok {
 		return managed.ExternalDelete{}, errors.New(errNotKubeconfig)
 	}
-
-	fmt.Printf("Deleting: %+v", cr)
 
 	return managed.ExternalDelete{}, nil
 }
@@ -252,6 +292,14 @@ func (c *external) Disconnect(ctx context.Context) error {
 
 // retrieveKubeconfig retrieves the kubeconfig from the Talos control plane node
 func (c *external) retrieveKubeconfig(ctx context.Context, cr *v1alpha1.Kubeconfig) (string, error) {
+	if c.retrieveKubeconfigFn != nil {
+		return c.retrieveKubeconfigFn(ctx, cr)
+	}
+
+	return retrieveKubeconfigFromTalos(ctx, cr)
+}
+
+func retrieveKubeconfigFromTalos(ctx context.Context, cr *v1alpha1.Kubeconfig) (string, error) {
 	// Get client configuration
 	clientConfig := cr.Spec.ForProvider.ClientConfiguration
 	if clientConfig.ClientCertificate == "" {
@@ -292,9 +340,131 @@ func (c *external) retrieveKubeconfig(ctx context.Context, cr *v1alpha1.Kubeconf
 		return "", errors.New("empty kubeconfig response from Talos node")
 	}
 
-	// The kubeconfig is returned as bytes, convert to string
-	kubeconfigData := string(kubeconfigBytes)
-
 	fmt.Printf("Successfully retrieved kubeconfig from node %s\n", cr.Spec.ForProvider.Node)
-	return kubeconfigData, nil
+
+	return string(kubeconfigBytes), nil
+}
+
+func parseKubeconfig(kubeconfigData string) (*v1alpha1.KubernetesClientConfiguration, error) {
+	config, err := clientcmd.Load([]byte(kubeconfigData))
+	if err != nil {
+		return nil, err
+	}
+
+	contextName, err := selectedContextName(config)
+	if err != nil {
+		return nil, err
+	}
+
+	contextConfig, ok := config.Contexts[contextName]
+	if !ok || contextConfig == nil {
+		return nil, errors.Errorf("kubeconfig context %q not found", contextName)
+	}
+
+	cluster, ok := config.Clusters[contextConfig.Cluster]
+	if !ok || cluster == nil {
+		return nil, errors.Errorf("kubeconfig cluster %q not found", contextConfig.Cluster)
+	}
+
+	authInfo, ok := config.AuthInfos[contextConfig.AuthInfo]
+	if !ok || authInfo == nil {
+		return nil, errors.Errorf("kubeconfig auth info %q not found", contextConfig.AuthInfo)
+	}
+
+	if err := validateEmbeddedClientConfiguration(cluster, authInfo); err != nil {
+		return nil, err
+	}
+
+	return &v1alpha1.KubernetesClientConfiguration{
+		Host:              cluster.Server,
+		CACertificate:     string(cluster.CertificateAuthorityData),
+		ClientCertificate: string(authInfo.ClientCertificateData),
+		ClientKey:         string(authInfo.ClientKeyData),
+	}, nil
+}
+
+func selectedContextName(config *clientcmdapi.Config) (string, error) {
+	if config.CurrentContext != "" {
+		return config.CurrentContext, nil
+	}
+	if len(config.Contexts) != 1 {
+		return "", errors.New("kubeconfig current context is required when multiple or no contexts are present")
+	}
+	for name := range config.Contexts {
+		return name, nil
+	}
+
+	return "", errors.New("kubeconfig current context is required when multiple or no contexts are present")
+}
+
+func validateEmbeddedClientConfiguration(cluster *clientcmdapi.Cluster, authInfo *clientcmdapi.AuthInfo) error {
+	if cluster.Server == "" {
+		return errors.New("kubeconfig cluster server is required")
+	}
+	if cluster.CertificateAuthority != "" {
+		return errors.New("kubeconfig certificate-authority file references are not supported")
+	}
+	if len(cluster.CertificateAuthorityData) == 0 {
+		return errors.New("kubeconfig cluster certificate-authority-data is required")
+	}
+	if authInfo.ClientCertificate != "" {
+		return errors.New("kubeconfig client-certificate file references are not supported")
+	}
+	if len(authInfo.ClientCertificateData) == 0 {
+		return errors.New("kubeconfig client-certificate-data is required")
+	}
+	if authInfo.ClientKey != "" {
+		return errors.New("kubeconfig client-key file references are not supported")
+	}
+	if len(authInfo.ClientKeyData) == 0 {
+		return errors.New("kubeconfig client-key-data is required")
+	}
+
+	return nil
+}
+
+func connectionDetails(kubeconfigData string, clientConfiguration *v1alpha1.KubernetesClientConfiguration) managed.ConnectionDetails {
+	details := connectionDetailsFromClientConfiguration(clientConfiguration)
+	details[connectionKeyKubeconfig] = []byte(kubeconfigData)
+
+	return details
+}
+
+func connectionDetailsFromClientConfiguration(clientConfiguration *v1alpha1.KubernetesClientConfiguration) managed.ConnectionDetails {
+	if clientConfiguration == nil {
+		return managed.ConnectionDetails{}
+	}
+
+	details := managed.ConnectionDetails{
+		connectionKeyHost:              []byte(clientConfiguration.Host),
+		connectionKeyCACertificate:     []byte(clientConfiguration.CACertificate),
+		connectionKeyClientCertificate: []byte(clientConfiguration.ClientCertificate),
+		connectionKeyClientKey:         []byte(clientConfiguration.ClientKey),
+	}
+
+	kubeconfigData, err := kubeconfigFromClientConfiguration(clientConfiguration)
+	if err == nil {
+		details[connectionKeyKubeconfig] = kubeconfigData
+	}
+
+	return details
+}
+
+func kubeconfigFromClientConfiguration(clientConfiguration *v1alpha1.KubernetesClientConfiguration) ([]byte, error) {
+	config := clientcmdapi.NewConfig()
+	config.CurrentContext = "default"
+	config.Clusters["default"] = &clientcmdapi.Cluster{
+		Server:                   clientConfiguration.Host,
+		CertificateAuthorityData: []byte(clientConfiguration.CACertificate),
+	}
+	config.AuthInfos["default"] = &clientcmdapi.AuthInfo{
+		ClientCertificateData: []byte(clientConfiguration.ClientCertificate),
+		ClientKeyData:         []byte(clientConfiguration.ClientKey),
+	}
+	config.Contexts["default"] = &clientcmdapi.Context{
+		Cluster:  "default",
+		AuthInfo: "default",
+	}
+
+	return clientcmd.Write(*config)
 }
