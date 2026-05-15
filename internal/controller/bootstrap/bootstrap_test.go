@@ -33,6 +33,8 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -90,7 +92,7 @@ func TestObserve(t *testing.T) {
 	}
 }
 
-func TestObserveWithSuccessfulExternalCreate(t *testing.T) {
+func TestObserveWithSuccessfulExternalCreateStillRequiresHealth(t *testing.T) {
 	createdAt := time.Date(2026, 5, 13, 20, 29, 41, 0, time.UTC)
 	cr := testBootstrap()
 	meta.SetExternalCreateSucceeded(cr, createdAt)
@@ -104,17 +106,46 @@ func TestObserveWithSuccessfulExternalCreate(t *testing.T) {
 	if !got.ResourceExists {
 		t.Fatal("e.Observe(...).ResourceExists = false, want true")
 	}
-	if !got.ResourceUpToDate {
-		t.Fatal("e.Observe(...).ResourceUpToDate = false, want true")
+	if got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = true, want false")
 	}
-	if !cr.Status.AtProvider.Bootstrapped {
-		t.Fatal("cr.Status.AtProvider.Bootstrapped = false, want true")
+	if cr.Status.AtProvider.Bootstrapped {
+		t.Fatal("cr.Status.AtProvider.Bootstrapped = true, want false")
 	}
-	if cr.Status.AtProvider.BootstrapTime == nil || !cr.Status.AtProvider.BootstrapTime.Time.Equal(createdAt) {
-		t.Fatalf("cr.Status.AtProvider.BootstrapTime = %v, want %v", cr.Status.AtProvider.BootstrapTime, createdAt)
+	if cr.Status.AtProvider.BootstrapTime != nil {
+		t.Fatalf("cr.Status.AtProvider.BootstrapTime = %v, want nil", cr.Status.AtProvider.BootstrapTime)
 	}
-	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got != corev1.ConditionTrue {
-		t.Fatalf("Ready condition status = %s, want %s", got, corev1.ConditionTrue)
+	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got == corev1.ConditionTrue {
+		t.Fatalf("Ready condition status = %s, want not %s", got, corev1.ConditionTrue)
+	}
+}
+
+func TestObserveWithBootstrappedStatusStillRequiresHealth(t *testing.T) {
+	bootstrapTime := metav1.NewTime(time.Date(2026, 5, 13, 20, 29, 41, 0, time.UTC))
+	cr := testBootstrap()
+	cr.Status.AtProvider.Bootstrapped = true
+	cr.Status.AtProvider.BootstrapTime = &bootstrapTime
+
+	e := external{isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return false }}
+	got, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("e.Observe(...): unexpected error: %v", err)
+	}
+
+	if !got.ResourceExists {
+		t.Fatal("e.Observe(...).ResourceExists = false, want true")
+	}
+	if got.ResourceUpToDate {
+		t.Fatal("e.Observe(...).ResourceUpToDate = true, want false")
+	}
+	if cr.Status.AtProvider.Bootstrapped {
+		t.Fatal("cr.Status.AtProvider.Bootstrapped = true, want false")
+	}
+	if cr.Status.AtProvider.BootstrapTime != nil {
+		t.Fatalf("cr.Status.AtProvider.BootstrapTime = %v, want nil", cr.Status.AtProvider.BootstrapTime)
+	}
+	if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got == corev1.ConditionTrue {
+		t.Fatalf("Ready condition status = %s, want not %s", got, corev1.ConditionTrue)
 	}
 }
 
@@ -185,6 +216,49 @@ func TestCreateAlreadyExistsHealthyIsSuccess(t *testing.T) {
 	}
 }
 
+func TestCreateSuccessMarksReadyOnlyWhenHealthy(t *testing.T) {
+	tests := map[string]struct {
+		healthy bool
+		want    corev1.ConditionStatus
+	}{
+		"Healthy": {
+			healthy: true,
+			want:    corev1.ConditionTrue,
+		},
+		"Unhealthy": {
+			want: corev1.ConditionUnknown,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			cr := testBootstrap()
+			bootstrapCalled := false
+			e := external{
+				bootstrapFn: func(context.Context, *v1alpha1.Bootstrap) error {
+					bootstrapCalled = true
+					return nil
+				},
+				isBootstrappedHealthyFn: func(context.Context, *v1alpha1.Bootstrap) bool { return tc.healthy },
+			}
+
+			_, err := e.Create(context.Background(), cr)
+			if err != nil {
+				t.Fatalf("e.Create(...): unexpected error: %v", err)
+			}
+			if !bootstrapCalled {
+				t.Fatal("e.Create(...): bootstrap was not called")
+			}
+			if cr.Status.AtProvider.Bootstrapped != tc.healthy {
+				t.Fatalf("cr.Status.AtProvider.Bootstrapped = %v, want %v", cr.Status.AtProvider.Bootstrapped, tc.healthy)
+			}
+			if got := cr.Status.GetCondition(xpv1.TypeReady).Status; got != tc.want {
+				t.Fatalf("Ready condition status = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCreateAlreadyExistsUnhealthyReturnsError(t *testing.T) {
 	cr := testBootstrap()
 	e := external{
@@ -250,6 +324,63 @@ func TestIsBootstrapAlreadyExists(t *testing.T) {
 			got := isBootstrapAlreadyExists(tc.err)
 			if got != tc.want {
 				t.Fatalf("isBootstrapAlreadyExists(...): got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsEtcdBootstrappedHealthy(t *testing.T) {
+	tests := map[string]struct {
+		services []talosclient.ServiceInfo
+		want     bool
+	}{
+		"RunningHealthyEtcd": {
+			services: []talosclient.ServiceInfo{{Service: &machineapi.ServiceInfo{
+				Id:     "etcd",
+				State:  "Running",
+				Health: &machineapi.ServiceHealth{Healthy: true},
+			}}},
+			want: true,
+		},
+		"PreparingEtcd": {
+			services: []talosclient.ServiceInfo{{Service: &machineapi.ServiceInfo{
+				Id:     "etcd",
+				State:  "Preparing",
+				Health: &machineapi.ServiceHealth{Healthy: true},
+				Events: &machineapi.ServiceEvents{Events: []*machineapi.ServiceEvent{{Msg: "please run talosctl bootstrap"}}},
+			}}},
+		},
+		"WaitingEtcd": {
+			services: []talosclient.ServiceInfo{{Service: &machineapi.ServiceInfo{
+				Id:     "etcd",
+				State:  "Waiting",
+				Health: &machineapi.ServiceHealth{Healthy: true},
+			}}},
+		},
+		"MissingHealth": {
+			services: []talosclient.ServiceInfo{{Service: &machineapi.ServiceInfo{Id: "etcd", State: "Running"}}},
+		},
+		"UnknownHealth": {
+			services: []talosclient.ServiceInfo{{Service: &machineapi.ServiceInfo{
+				Id:     "etcd",
+				State:  "Running",
+				Health: &machineapi.ServiceHealth{Unknown: true, Healthy: true},
+			}}},
+		},
+		"BootstrapRequiredMessage": {
+			services: []talosclient.ServiceInfo{{Service: &machineapi.ServiceInfo{
+				Id:     "etcd",
+				State:  "Running",
+				Health: &machineapi.ServiceHealth{Healthy: true, LastMessage: "please run talosctl bootstrap"},
+			}}},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := isEtcdBootstrappedHealthy(tc.services)
+			if got != tc.want {
+				t.Fatalf("isEtcdBootstrappedHealthy(...): got %v, want %v", got, tc.want)
 			}
 		})
 	}

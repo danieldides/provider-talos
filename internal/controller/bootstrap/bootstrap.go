@@ -182,20 +182,22 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	fmt.Printf("Observing Bootstrap: %s\n", cr.Name)
 
-	bootstrapped := resolveBootstrappedStatus(cr)
-	if bootstrapped {
-		cr.SetConditions(xpv1.Available())
-	}
+	bootstrapped := false
+	attemptedBootstrap := cr.Status.AtProvider.Bootstrapped || hasSuccessfulExternalCreate(cr)
 
-	if !bootstrapped && c.isBootstrappedHealthy(ctx, cr) {
+	if c.isBootstrappedHealthy(ctx, cr) {
 		markBootstrapped(cr, metav1.Now())
 		bootstrapped = true
+	} else {
+		cr.Status.AtProvider.Bootstrapped = false
+		cr.Status.AtProvider.BootstrapTime = nil
 	}
 
-	fmt.Printf("Bootstrap exists: %v, up to date: %v\n", bootstrapped, bootstrapped)
+	resourceExists := bootstrapped || attemptedBootstrap
+	fmt.Printf("Bootstrap exists: %v, up to date: %v\n", resourceExists, bootstrapped)
 
 	return managed.ExternalObservation{
-		ResourceExists:    bootstrapped,
+		ResourceExists:    resourceExists,
 		ResourceUpToDate:  bootstrapped,
 		ConnectionDetails: managed.ConnectionDetails{},
 	}, nil
@@ -225,7 +227,9 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalCreation{}, errors.Wrap(err, "failed to bootstrap Talos cluster")
 	}
 
-	markBootstrapped(cr, metav1.Now())
+	if c.isBootstrappedHealthy(ctx, cr) {
+		markBootstrapped(cr, metav1.Now())
+	}
 
 	return managed.ExternalCreation{
 		ConnectionDetails: managed.ConnectionDetails{},
@@ -268,27 +272,6 @@ func (c *external) bootstrap(ctx context.Context, cr *v1alpha1.Bootstrap) error 
 	}
 
 	return c.bootstrapTalosCluster(ctx, cr)
-}
-
-func resolveBootstrappedStatus(cr *v1alpha1.Bootstrap) bool {
-	bootstrapped := cr.Status.AtProvider.Bootstrapped || hasSuccessfulExternalCreate(cr)
-	if !bootstrapped {
-		return false
-	}
-
-	if cr.Status.AtProvider.BootstrapTime == nil {
-		if t := meta.GetExternalCreateSucceeded(cr); !t.IsZero() {
-			bootstrapTime := metav1.NewTime(t)
-			cr.Status.AtProvider.BootstrapTime = &bootstrapTime
-		}
-	}
-	if cr.Status.AtProvider.BootstrapTime == nil {
-		now := metav1.Now()
-		cr.Status.AtProvider.BootstrapTime = &now
-	}
-	cr.Status.AtProvider.Bootstrapped = true
-
-	return true
 }
 
 func hasSuccessfulExternalCreate(cr *v1alpha1.Bootstrap) bool {
@@ -352,8 +335,48 @@ func (c *external) isBootstrappedHealthy(ctx context.Context, cr *v1alpha1.Boots
 	}
 	defer talosClient.Close() //nolint:errcheck
 
-	_, err = talosClient.Version(talosclient.WithNode(checkCtx, cr.Spec.ForProvider.Node))
-	return err == nil
+	services, err := talosClient.ServiceInfo(talosclient.WithNode(checkCtx, cr.Spec.ForProvider.Node), "etcd")
+	if err != nil {
+		return false
+	}
+
+	return isEtcdBootstrappedHealthy(services)
+}
+
+func isEtcdBootstrappedHealthy(services []talosclient.ServiceInfo) bool {
+	for _, serviceInfo := range services {
+		service := serviceInfo.Service
+		if service == nil || service.GetId() != "etcd" || service.GetState() != "Running" {
+			continue
+		}
+
+		health := service.GetHealth()
+		if health == nil || health.GetUnknown() || !health.GetHealthy() {
+			continue
+		}
+
+		if strings.Contains(strings.ToLower(health.GetLastMessage()), "talosctl bootstrap") {
+			continue
+		}
+
+		bootstrapRequired := false
+		for _, event := range service.GetEvents().GetEvents() {
+			if event == nil {
+				continue
+			}
+			if strings.Contains(strings.ToLower(event.GetMsg()), "talosctl bootstrap") {
+				bootstrapRequired = true
+				break
+			}
+		}
+		if bootstrapRequired {
+			continue
+		}
+
+		return true
+	}
+
+	return false
 }
 
 // bootstrapTalosCluster bootstraps the Talos cluster on the specified control plane node
